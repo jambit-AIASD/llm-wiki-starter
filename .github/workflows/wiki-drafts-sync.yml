@@ -1,0 +1,509 @@
+# wiki-drafts-sync.yml
+# Triggered by: daily cron (gated by WIKI_DRAFTS_SYNC_CRON_ENABLED) or manual
+# workflow_dispatch (optionally scoped to one show via show_filter). Manual
+# dispatch can also set dry_run to list what would be synced — path, category,
+# and file size — without writing raw/, touching drafts-manifest.jsonl, or committing.
+#
+# Pulls matb711/krt-scripts-mirror (private, read-only via a DRAFTS_REPO_SSH_KEY
+# deploy key — a fine-grained PAT only reaches repos owned by the account that
+# minted it, and this repo is owned by Mat's account, not Don's; a deploy key
+# is attached to the repo directly and isn't subject to that limit) and diffs it
+# against this repo's raw/ snapshots. The drafts repo's root-level folders
+# are show names, mapped straight onto raw/<show-slug>/.
+#
+# Staleness is self-owned via drafts-manifest.jsonl (repo root, append-only —
+# same convention as ingest-manifest.jsonl): each tracked path's most recent
+# line records a sha256 content hash, and a file is only re-synced when its
+# current hash differs from that last-recorded hash. This does NOT depend on
+# any manifest krt-scripts-mirror itself may keep — that repo's manifest is a
+# permission list with no dates, confirmed by HAL (KryptoBrain) 2026-08-12; see
+# docs/plans/2026-08-12-hal-review-hardening.md P0.1. A path present in a prior
+# sync but absent from the current checkout gets a "deleted" line appended —
+# raw/ itself is never touched by a deletion (General Rule 1: raw/ is never
+# edited in place; old snapshots stay as history).
+#
+# raw/ lands drafts into three subfolders by content class:
+#   raw/<show-slug>/               numbered text drafts (.md/.txt), unchanged naming
+#   raw/<show-slug>/rehearsal/     mirrors the source repo's own <show>/rehearsal/
+#   raw/<show-slug>/pdf/           root-level PDF renderings (converted via the
+#                                  binary-transform + pdf skill, staged through
+#                                  import/<show-slug>/ first — gitignored, never committed)
+# Every snapshot this workflow writes still carries the two-line provenance header —
+#   <!-- github_source: matb711/krt-scripts-mirror@<commit-sha>:<path-in-drafts-repo> -->
+#   <!-- revision: <YYYY-MM-DD> -->
+# — since wiki-curate.yml's Claude invocation has no Bash/git access and reads
+# this as plain text (see CLAUDE.md's Source Page Format and docs/architecture.md).
+#
+# Writes raw/ (and drafts-manifest.jsonl) only and exits — no wiki curation here.
+# A push to raw/** triggers wiki-ingest-push.yml automatically, which dispatches
+# wiki-curate.yml exactly as it would for any other raw file. Full design notes:
+# docs/architecture.md.
+
+name: Wiki Drafts Sync
+run-name: "wiki-drafts-sync: ${{ github.event.inputs.show_filter || 'all shows' }}${{ github.event.inputs.dry_run == 'true' && ' (dry run)' || '' }}"
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily
+  workflow_dispatch:
+    inputs:
+      show_filter:
+        description: "Optional: only sync this show's root folder name in the drafts repo"
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run: list files (with sizes) that would be synced, write nothing"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.event_name == 'schedule' && vars.WIKI_DRAFTS_SYNC_CRON_ENABLED != 'true' && format('cron-disabled-{0}', github.run_id) || 'wiki-drafts-sync' }}
+  cancel-in-progress: false # queue runs; parallel execution risks git conflicts
+
+permissions:
+  contents: write
+
+jobs:
+  cron-disabled:
+    name: Cron gate
+    if: github.event_name == 'schedule' && vars.WIKI_DRAFTS_SYNC_CRON_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log skip reason
+        run: |
+          echo "Cron skipped — WIKI_DRAFTS_SYNC_CRON_ENABLED is not set to 'true'." \
+            >> $GITHUB_STEP_SUMMARY
+
+  sync:
+    name: Sync drafts repo into raw/
+    if: |
+      github.event_name != 'schedule' ||
+      vars.WIKI_DRAFTS_SYNC_CRON_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      NEEDS_CONVERT: ""
+
+    steps:
+      # ── 1. Checkout this repo ──────────────────────────────────────────────
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          token: ${{ secrets.WIKI_PAT }}
+
+      # ── 2. Checkout the private drafts repo (read-only) ───────────────────
+      - name: Checkout krt-scripts-mirror
+        uses: actions/checkout@v4
+        with:
+          repository: matb711/krt-scripts-mirror
+          ssh-key: ${{ secrets.DRAFTS_REPO_SSH_KEY }}
+          path: drafts-repo
+          fetch-depth: 0 # full history needed for per-file last-changed-commit lookup
+
+      # ── 3. Diff against drafts-manifest.jsonl, write new/changed snapshots ──
+      # Change detection is by sha256 content hash (drafts-manifest.jsonl), not
+      # by any manifest krt-scripts-mirror itself keeps — see the file header.
+      # Text lands in raw/ directly; PDFs are staged to import/ (gitignored)
+      # for the conversion step below; anything else is skipped with a warning.
+      - name: Diff drafts repo against drafts-manifest.jsonl
+        id: sync
+        env:
+          SHOW_FILTER: ${{ github.event.inputs.show_filter }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess
+          from datetime import datetime, timezone
+
+          DRAFTS = "drafts-repo"
+          MANIFEST = "drafts-manifest.jsonl"
+          TEXT_EXTS = {".md", ".txt"}
+          BINARY_EXTS = {".pdf"}
+          show_filter = os.environ.get("SHOW_FILTER", "").strip()
+          DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
+
+          def human_size(n):
+              for unit in ("B", "KB", "MB", "GB"):
+                  if n < 1024 or unit == "GB":
+                      return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+                  n /= 1024
+
+          def git(*args):
+              return subprocess.run(
+                  ["git", *args], cwd=DRAFTS, capture_output=True, text=True, check=True
+              ).stdout.strip()
+
+          def slugify(name):
+              s = re.sub(r"[^a-z0-9]+", "-", name.strip().lower())
+              return re.sub(r"-{2,}", "-", s).strip("-")
+
+          def sha256_of(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(65536), b""):
+                      h.update(chunk)
+              return "sha256:" + h.hexdigest()
+
+          def now_iso():
+              return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          # Load latest known state per path (last line wins) — the manifest is
+          # append-only and never rewritten; "current state" is derived at read
+          # time, same split as HAL's note items 2/3 applied to sync bookkeeping.
+          latest = {}
+          if os.path.exists(MANIFEST):
+              with open(MANIFEST, encoding="utf-8") as fh:
+                  for line in fh:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      entry = json.loads(line)
+                      latest[entry["path"]] = entry
+
+          new_entries = []
+          changed, skipped, pending_pdf, dryrun_report = [], [], [], []
+          seen_paths = set()
+
+          for root, dirs, files in os.walk(DRAFTS):
+              dirs[:] = [d for d in dirs if d != ".git"]
+              rel_root = os.path.relpath(root, DRAFTS)
+              if rel_root == ".":
+                  continue  # skip files sitting at the drafts-repo root (not under a show folder)
+
+              parts = rel_root.split(os.sep)
+              show_name = parts[0]
+              if show_filter and show_name != show_filter:
+                  continue
+              show_slug = slugify(show_name)
+              in_rehearsal = parts[1:2] == ["rehearsal"]
+
+              for fname in files:
+                  relpath = os.path.normpath(os.path.join(rel_root, fname))
+                  seen_paths.add(relpath)
+                  ext = os.path.splitext(fname)[1].lower()
+
+                  if ext not in TEXT_EXTS and ext not in BINARY_EXTS:
+                      skipped.append(relpath)
+                      continue
+
+                  abspath = os.path.join(DRAFTS, relpath)
+                  file_hash = sha256_of(abspath)
+                  prior = latest.get(relpath)
+                  if prior and prior.get("status") != "deleted" and prior.get("hash") == file_hash:
+                      continue  # unchanged since last sync
+
+                  commit_sha = git("log", "-1", "--format=%H", "--", relpath)
+                  commit_epoch = git("log", "-1", "--format=%ct", "--", relpath)
+                  if not commit_sha:
+                      continue  # no history for this path — shouldn't happen on a clean checkout
+                  commit_dt = datetime.fromtimestamp(int(commit_epoch), timezone.utc)
+                  commit_ts = commit_dt.strftime("%Y%m%dT%H%M%SZ")
+                  commit_date = commit_dt.strftime("%Y-%m-%d")
+
+                  is_binary = ext in BINARY_EXTS
+                  # Routing: rehearsal/ wins if the source path is under it (regardless
+                  # of extension), otherwise binaries land in pdf/, text stays at root.
+                  category_dir = "rehearsal" if in_rehearsal else ("pdf" if is_binary else None)
+                  out_dir = os.path.join("raw", show_slug, category_dir) if category_dir else os.path.join("raw", show_slug)
+
+                  # Name relative to the category anchor (show root, or its rehearsal/
+                  # folder) so subfolder depth never collides with another category.
+                  anchor = os.path.join(show_name, "rehearsal") if in_rehearsal else show_name
+                  name_rel = os.path.relpath(relpath, anchor).replace(os.sep, "-")
+                  # Binary/rehearsal targets keep the original filename+extension —
+                  # appended, never replaced, matching wiki-ingest.yml's rule. Numbered
+                  # text drafts at the show root strip the extension, unchanged.
+                  base_name = name_rel if (is_binary or in_rehearsal) else os.path.splitext(name_rel)[0]
+
+                  target = os.path.join(out_dir, f"{base_name}-{commit_ts}.md")
+                  base, suffix = target, 2
+                  while os.path.exists(target):
+                      target = base[:-3] + f"-{suffix}.md"
+                      suffix += 1
+
+                  status = "modified" if prior else "added"
+
+                  if DRY_RUN:
+                      # List-only: no directories, imports, or raw/ writes — see the
+                      # dry_run workflow input.
+                      dryrun_report.append({
+                          "status": status, "relpath": relpath, "target": target,
+                          "size": os.path.getsize(abspath),
+                          "category": "pdf" if is_binary else ("rehearsal" if in_rehearsal else "draft"),
+                      })
+                      continue
+
+                  os.makedirs(out_dir, exist_ok=True)
+                  import_path = None
+                  if is_binary:
+                      import_dir = os.path.join("import", show_slug)
+                      os.makedirs(import_dir, exist_ok=True)
+                      import_path = os.path.join(import_dir, fname)
+                      with open(abspath, "rb") as src, open(import_path, "wb") as dst:
+                          dst.write(src.read())
+                      pending_pdf.append(f"{import_path}\t{target}\t{commit_sha}\t{commit_date}\t{relpath}")
+                  else:
+                      with open(abspath, encoding="utf-8") as fh:
+                          body = fh.read()
+                      header = (
+                          f"<!-- github_source: matb711/krt-scripts-mirror@{commit_sha}:{relpath} -->\n"
+                          f"<!-- revision: {commit_date} -->\n\n"
+                      )
+                      with open(target, "w", encoding="utf-8") as fh:
+                          fh.write(header + body)
+                      changed.append(target)
+
+                  new_entries.append({
+                      "path": relpath, "show_slug": show_slug, "hash": file_hash,
+                      "status": status, "synced_at": now_iso(),
+                      "import_path": import_path, "raw_target": target, "commit_sha": commit_sha,
+                  })
+
+          # Deletion detection — scoped to what this run actually walked, so a
+          # show_filter run never falsely marks other shows' files as deleted.
+          # raw/ itself is never touched: old snapshots stay as history (General Rule 1).
+          filter_slug = slugify(show_filter) if show_filter else None
+          for path, entry in latest.items():
+              if entry.get("status") == "deleted":
+                  continue
+              if filter_slug and entry.get("show_slug") != filter_slug:
+                  continue
+              if path in seen_paths:
+                  continue
+              if DRY_RUN:
+                  dryrun_report.append({
+                      "status": "deleted", "relpath": path, "target": entry.get("raw_target"),
+                      "size": None, "category": None,
+                  })
+                  continue
+              new_entries.append({
+                  "path": path, "show_slug": entry.get("show_slug"), "hash": entry.get("hash"),
+                  "status": "deleted", "synced_at": now_iso(),
+                  "import_path": None, "raw_target": entry.get("raw_target"), "commit_sha": None,
+              })
+
+          if not DRY_RUN:
+              with open(MANIFEST, "a", encoding="utf-8") as fh:
+                  for entry in new_entries:
+                      fh.write(json.dumps(entry) + "\n")
+
+          with open("/tmp/drafts_sync_changed.txt", "w") as fh:
+              fh.write("\n".join(changed))
+          with open("/tmp/drafts_sync_skipped.txt", "w") as fh:
+              fh.write("\n".join(skipped))
+          with open("/tmp/drafts_sync_pending_pdf.txt", "w") as fh:
+              fh.write("\n".join(pending_pdf))
+          with open("/tmp/drafts_sync_deleted.txt", "w") as fh:
+              fh.write("\n".join(e["path"] for e in new_entries if e["status"] == "deleted"))
+          with open("/tmp/drafts_sync_dryrun.txt", "w") as fh:
+              for e in dryrun_report:
+                  size_str = human_size(e["size"]) if e["size"] is not None else "-"
+                  fh.write(f"{e['status']}\t{e['category'] or '-'}\t{e['relpath']}\t{e['target'] or '-'}\t{size_str}\n")
+
+          with open(os.environ["GITHUB_ENV"], "a") as fh:
+              fh.write(f"NEEDS_CONVERT={'true' if (pending_pdf and not DRY_RUN) else 'false'}\n")
+
+          if DRY_RUN:
+              print(f"[dry run] Would sync: {len(dryrun_report)}  Skipped: {len(skipped)}")
+          else:
+              deleted_count = sum(1 for e in new_entries if e["status"] == "deleted")
+              print(f"Changed: {len(changed)}  Pending PDF: {len(pending_pdf)}  Skipped: {len(skipped)}  Deleted: {deleted_count}")
+          PY
+
+      # ── 4. Install Claude Code CLI (PDF conversion only) ──────────────────
+      - name: Get Claude CLI version
+        id: cli
+        if: env.NEEDS_CONVERT == 'true'
+        run: echo "version=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Claude CLI
+        id: cli-cache
+        if: env.NEEDS_CONVERT == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: claude-cli-${{ runner.os }}-${{ steps.cli.outputs.version }}
+
+      - name: Install Claude Code CLI
+        if: env.NEEDS_CONVERT == 'true' && steps.cli-cache.outputs.cache-hit != 'true'
+        run: npm install -g --prefix ~/.npm-global @anthropic-ai/claude-code
+
+      - name: Add Claude CLI to PATH
+        if: env.NEEDS_CONVERT == 'true'
+        run: echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Set up uv (for binary skills)
+        if: env.NEEDS_CONVERT == 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Cache pandoc binary
+        if: env.NEEDS_CONVERT == 'true'
+        id: pandoc-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/pandoc
+          key: pandoc-${{ runner.os }}
+
+      - name: Install pandoc
+        if: env.NEEDS_CONVERT == 'true' && steps.pandoc-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y --no-install-recommends pandoc
+
+      - name: Cache pdftotext binary
+        if: env.NEEDS_CONVERT == 'true'
+        id: poppler-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/pdftotext
+          key: poppler-${{ runner.os }}
+
+      - name: Install poppler-utils (for PDF → Markdown conversion)
+        if: env.NEEDS_CONVERT == 'true' && steps.poppler-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y --no-install-recommends poppler-utils
+
+      - name: Accept Claude Code workspace trust
+        if: env.NEEDS_CONVERT == 'true'
+        run: |
+          mkdir -p /home/runner
+          printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$GITHUB_WORKSPACE" \
+            > /home/runner/.claude.json
+
+      # ── 5. Convert pending PDFs via the binary-transform + pdf skill ──────
+      # One claude invocation per file, same allowedTools as wiki-ingest.yml.
+      # The skill only converts — it doesn't know this repo's provenance-header
+      # convention, so the header is prepended here, same as the text path above.
+      - name: Convert pending PDFs
+        if: env.NEEDS_CONVERT == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          : > /tmp/drafts_sync_convert_failed.txt
+          while IFS=$'\t' read -r IMPORT_PATH TARGET COMMIT_SHA COMMIT_DATE RELPATH; do
+            [ -z "$IMPORT_PATH" ] && continue
+            PROMPT="Use the binary-transform skill to convert '${IMPORT_PATH}' to Markdown at '${TARGET}'. Follow the skill exactly."
+            echo "$PROMPT" | claude --print --allowedTools 'Skill,Read,Write,Bash'
+
+            if [ ! -s "$TARGET" ]; then
+              echo "::error::Conversion did not produce a usable file at $TARGET (source: $RELPATH)"
+              echo "$RELPATH" >> /tmp/drafts_sync_convert_failed.txt
+              continue
+            fi
+
+            HEADER="<!-- github_source: matb711/krt-scripts-mirror@${COMMIT_SHA}:${RELPATH} -->
+          <!-- revision: ${COMMIT_DATE} -->"
+            { printf '%s\n\n' "$HEADER"; cat "$TARGET"; } > "${TARGET}.tmp" && mv "${TARGET}.tmp" "$TARGET"
+
+            echo "$TARGET" >> /tmp/drafts_sync_changed.txt
+          done < /tmp/drafts_sync_pending_pdf.txt
+
+      # ── 6. Commit + push to main (rebase-retry) ────────────────────────────
+      - name: Commit and push to main
+        id: push
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          git add raw/ 2>/dev/null || true
+          [ -f drafts-manifest.jsonl ] && git add drafts-manifest.jsonl
+          [ -f ingest-manifest.jsonl ] && git add ingest-manifest.jsonl
+
+          if git diff --cached --quiet; then
+            echo "No new, changed, or deleted drafts — nothing to commit."
+            echo "result=noop" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name  "wiki-drafts-sync-bot"
+          git config user.email "wiki-drafts-sync@noreply.github.com"
+
+          COUNT=0
+          [ -s /tmp/drafts_sync_changed.txt ] && COUNT=$(grep -c . /tmp/drafts_sync_changed.txt)
+          DELETED_COUNT=0
+          [ -s /tmp/drafts_sync_deleted.txt ] && DELETED_COUNT=$(grep -c . /tmp/drafts_sync_deleted.txt)
+
+          if [ "$COUNT" -gt 0 ]; then
+            SUBJECT="raw: sync ${COUNT} draft(s) from krt-scripts-mirror"
+            [ "$DELETED_COUNT" -gt 0 ] && SUBJECT="${SUBJECT}, ${DELETED_COUNT} deletion(s) recorded"
+            TRAILERS="X-Wiki-Workflow: ingest"
+            while IFS= read -r F; do
+              [ -z "$F" ] && continue
+              TRAILERS="${TRAILERS}
+          X-Raw-Source: ${F}"
+            done < /tmp/drafts_sync_changed.txt
+          else
+            # Deletions only — nothing new for wiki-curate.yml to pick up.
+            SUBJECT="chore: record ${DELETED_COUNT} deletion(s) in drafts-manifest.jsonl"
+            TRAILERS=""
+          fi
+
+          git commit -m "$SUBJECT" -m "" -m "$TRAILERS"
+
+          # Rebase-retry loop: handles the rare case of a concurrent raw/ write.
+          MAX_RETRIES=3
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt ${attempt}/${MAX_RETRIES}..."
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "result=failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Rebase conflict — re-run the workflow; the diff is recomputed from scratch each run, so nothing is lost"
+              exit 1
+            fi
+            if git push origin main; then
+              echo "result=pushed" >> "$GITHUB_OUTPUT"
+              echo "Pushed to main (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Push rejected — retrying..."
+          done
+
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+          echo "::error::All push retries exhausted"
+          exit 1
+
+      # ── 7. Job summary ─────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Wiki Drafts Sync" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "### Dry run — nothing written, nothing committed" >> $GITHUB_STEP_SUMMARY
+            if [ -s /tmp/drafts_sync_dryrun.txt ]; then
+              echo "| Status | Category | Source | Would write to | Size |" >> $GITHUB_STEP_SUMMARY
+              echo "|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+              awk -F'\t' '{printf "| %s | %s | `%s` | `%s` | %s |\n", $1, $2, $3, $4, $5}' /tmp/drafts_sync_dryrun.txt >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No new, changed, or deleted drafts since last sync." >> $GITHUB_STEP_SUMMARY
+            fi
+            if [ -s /tmp/drafts_sync_skipped.txt ]; then
+              echo "### Skipped (unrecognized extension)" >> $GITHUB_STEP_SUMMARY
+              sed 's/^/- `/;s/$/`/' /tmp/drafts_sync_skipped.txt >> $GITHUB_STEP_SUMMARY
+            fi
+            exit 0
+          fi
+
+          RESULT="${{ steps.push.outputs.result }}"
+          if [ "$RESULT" = "pushed" ]; then
+            echo "### Synced" >> $GITHUB_STEP_SUMMARY
+            [ -s /tmp/drafts_sync_changed.txt ] && sed 's/^/- `/;s/$/`/' /tmp/drafts_sync_changed.txt >> $GITHUB_STEP_SUMMARY
+          elif [ "$RESULT" = "noop" ]; then
+            echo "No new or changed drafts since last sync." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Push failed — see job log." >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -s /tmp/drafts_sync_deleted.txt ]; then
+            echo "### Deleted upstream (recorded in drafts-manifest.jsonl; raw/ snapshots kept as history)" >> $GITHUB_STEP_SUMMARY
+            sed 's/^/- `/;s/$/`/' /tmp/drafts_sync_deleted.txt >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -s /tmp/drafts_sync_convert_failed.txt ]; then
+            echo "### ⚠️ PDF conversion failed" >> $GITHUB_STEP_SUMMARY
+            sed 's/^/- `/;s/$/`/' /tmp/drafts_sync_convert_failed.txt >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -s /tmp/drafts_sync_skipped.txt ]; then
+            echo "### Skipped (unrecognized extension)" >> $GITHUB_STEP_SUMMARY
+            sed 's/^/- `/;s/$/`/' /tmp/drafts_sync_skipped.txt >> $GITHUB_STEP_SUMMARY
+          fi

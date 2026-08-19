@@ -1,0 +1,148 @@
+# wiki-review.yml
+# Merges raw-file ingest conflict PRs after a human signs off.
+#
+# wiki-ingest.yml opens these PRs (branch `ingest/*`, tagged 'needs-review')
+# when it exhausts its rebase retries staging a file into raw/. When the tag is
+# REMOVED — or a review is submitted as approved — the PR is merged here.
+#
+# NOTE: these PRs contain raw/ and ingest-manifest.jsonl only (wiki-ingest.yml
+# does `git add raw/`); they never touch wiki/. A Claude Page-LINT gate used to
+# sit in this workflow, conditioned on the diff touching wiki/ — which for these
+# PRs is never true, so it never ran, and the empty result set made the merge
+# gate vacuously pass. It was removed 2026-08-15 as dead code.
+#
+# Wiki content is not gated here and does not need to be: wiki-curate.yml pushes
+# straight to main, so there is no PR to gate. Wiki health is audited whole-corpus
+# by wiki-lint.yml, which catches the cross-page rot a diff review structurally
+# cannot see.
+
+name: Wiki Review
+
+on:
+  pull_request:
+    types: [unlabeled]
+  pull_request_review:
+    types: [submitted]
+
+# One review run per PR at a time: approving AND removing the label would
+# otherwise race two runs into the same merge.
+concurrency:
+  group: wiki-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  review:
+    name: Merge approved ingest conflict PR
+    runs-on: ubuntu-latest
+    # Only wiki ingest conflict PRs (ingest/ branches) are handled here.
+    if: |
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'unlabeled' &&
+       github.event.label.name == 'needs-review' &&
+       startsWith(github.event.pull_request.head.ref, 'ingest/')) ||
+      (github.event_name == 'pull_request_review' &&
+       github.event.review.state == 'approved' &&
+       startsWith(github.event.pull_request.head.ref, 'ingest/'))
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.WIKI_PAT }}
+
+      - name: Merge PR
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.WIKI_PAT }}
+          script: |
+            const pr = context.payload.pull_request;
+
+            // The 'unlabeled' + 'approved' triggers can both fire for one PR;
+            // the concurrency group serializes them, so a follow-up run must
+            // no-op if the first one already merged.
+            const { data: fresh } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              pull_number: pr.number,
+            });
+            if (fresh.merged || fresh.state !== 'open') {
+              console.log(`PR #${pr.number} is already ${fresh.merged ? 'merged' : fresh.state} — nothing to do.`);
+              return;
+            }
+
+            // A plain comment, not an APPROVE review: these PRs are created with
+            // the same WIKI_PAT identity, and GitHub rejects self-approval (422).
+            await github.rest.issues.createComment({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: pr.number,
+              body:         '✅ **Approved** — auto-merging this raw-file ingest conflict PR.',
+            });
+
+            try {
+              await github.rest.pulls.merge({
+                owner:          context.repo.owner,
+                repo:           context.repo.repo,
+                pull_number:    pr.number,
+                merge_method:   'squash',
+                commit_title:   `wiki: merge conflict ingest PR #${pr.number}`,
+                commit_message: 'Raw-file ingest conflict resolved and approved by a human reviewer.',
+              });
+            } catch (e) {
+              // Typically 405: not mergeable (e.g. label removed without actually
+              // resolving conflicts). Restore the gate instead of going red.
+              console.log(`Merge failed: ${e.message}`);
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: pr.number, labels: ['needs-review'],
+              });
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: pr.number,
+                body: `⚠️ **Auto-merge failed** (${e.message}). The PR is likely not mergeable — resolve conflicts with \`main\`, then remove the \`needs-review\` label again.`,
+              });
+              return;
+            }
+
+            // Delete the merged head branch.
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                ref:   `heads/${pr.head.ref}`,
+              });
+            } catch (e) {
+              console.log(`Branch cleanup skipped: ${e.message}`);
+            }
+
+            console.log(`PR #${pr.number} merged.`);
+
+      # ── Safety net ───────────────────────────────────────────────────────────
+      # The human already removed the 'needs-review' label to get here. If this
+      # job fails before the merge step handles it (e.g. checkout failure), the
+      # PR would be left open with no gate and no explanation — so restore the
+      # label. The merge step handles its own failures inline and returns, so
+      # this only fires on an outright step failure.
+      - name: Restore gate if the run failed
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.WIKI_PAT }}
+          script: |
+            const pr = context.payload.pull_request;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            await github.rest.issues.addLabels({
+              ...context.repo, issue_number: pr.number, labels: ['needs-review'],
+            });
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: pr.number,
+              body: `⚠️ **Wiki Review failed to complete** — the \`needs-review\` label has been restored so this PR stays gated. See the [workflow run](${runUrl}) for details, then remove the label again to retry.`,
+            });
+            console.log(`PR #${pr.number} re-tagged after run failure.`);

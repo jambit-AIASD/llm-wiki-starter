@@ -1,0 +1,412 @@
+# wiki-ingest.yml
+# Triggered by repository_dispatch with event type "wiki-ingest".
+#
+# Payload shape:
+# {
+#   "event_type": "wiki-ingest",
+#   "client_payload": {
+#     "file_url":       "https://<account>.blob.core.windows.net/<container>/<guid>-<filename>?<sas>",
+#     "filename":       "<filename>",
+#     "subpath":        "optional/topic/subfolder",
+#     "commit_message": "optional override"
+#   }
+# }
+# subpath is an optional topical organizer — raw/ is structured as raw/{subpath}/...
+#
+# file_url is a short-lived Blob Storage SAS URL (self-authenticating — no extra header needed).
+#
+# Writes raw/ only and exits — no wiki curation. Claude is invoked only for binary-to-Markdown
+# conversion (binary-transform skill). Wiki curation is handled by wiki-curate.yml, which fires
+# automatically via the raw/** push trigger.
+
+name: Wiki Ingest
+run-name: "${{ github.event.client_payload.commit_message || format('raw: ingest {0}', github.event.client_payload.filename) }}"
+
+on:
+  repository_dispatch:
+    types: [wiki-ingest]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  ingest:
+    name: Ingest source file to raw/
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NEEDS_CONVERT: ""
+      INGEST_BLOCKED: ""
+    outputs:
+      file_path: ${{ steps.path.outputs.file_path }}
+      push_result: ${{ steps.push.outputs.result }}
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # Shallow: nothing here needs history — the rebase-retry loop's merge
+          # base is the checked-out tip, and each fetch deepens as needed.
+          fetch-depth: 1
+          token: ${{ secrets.WIKI_PAT }}
+
+      # ── 2. Route + download ────────────────────────────────────────────────
+
+      # 2a: Detect file type and set routing env vars.
+      #   NEEDS_CONVERT=false   → text file, goes straight to raw/
+      #   NEEDS_CONVERT=true    → binary, download to import/ then pre-transform
+      #   NEEDS_CONVERT=skip    → unknown extension, record in manifest and stop
+      - name: Route file to raw/ or import/
+        id: path
+        env:
+          FILENAME: ${{ github.event.client_payload.filename }}
+          SUBPATH: ${{ github.event.client_payload.subpath }}
+        run: |
+          # BASE_PATH is either empty or "subpath/" (with a trailing slash).
+          SUBPATH="${SUBPATH#/}"; SUBPATH="${SUBPATH%/}"
+          BASE_PATH=""
+          [ -n "$SUBPATH" ] && BASE_PATH="${SUBPATH}/"
+
+          EXT="${FILENAME##*.}"
+          EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+
+          TEXT_EXTS="md txt csv json xml yaml yml vtt srt"
+          BINARY_EXTS="pdf pptx docx xlsx html htm"
+
+          if echo "$TEXT_EXTS" | grep -qw "$EXT_LOWER"; then
+            RAW_PATH="raw/${BASE_PATH}${FILENAME}"
+            IMPORT_PATH=""
+            NEEDS_CONVERT="false"
+          elif echo "$BINARY_EXTS" | grep -qw "$EXT_LOWER"; then
+            # Extension APPENDED, not replaced: spec.pptx → spec.pptx.md
+            RAW_PATH="raw/${BASE_PATH}${FILENAME}.md"
+            IMPORT_PATH="import/${BASE_PATH}${FILENAME}"
+            NEEDS_CONVERT="true"
+          else
+            echo "::warning::Unknown extension '$EXT_LOWER' — file will be recorded in manifest but NOT ingested"
+            RAW_PATH=""
+            IMPORT_PATH="import/${BASE_PATH}${FILENAME}"
+            NEEDS_CONVERT="skip"
+          fi
+
+          echo "RAW_PATH=${RAW_PATH}"           >> "$GITHUB_ENV"
+          echo "IMPORT_PATH=${IMPORT_PATH}"     >> "$GITHUB_ENV"
+          echo "NEEDS_CONVERT=${NEEDS_CONVERT}" >> "$GITHUB_ENV"
+          echo "FILE_PATH=${RAW_PATH:-$IMPORT_PATH}" >> "$GITHUB_ENV"
+          echo "file_path=${RAW_PATH:-$IMPORT_PATH}" >> "$GITHUB_OUTPUT"
+
+      # 2b: Download the file. On skip, write a manifest entry and exit early.
+      #     On the text path, enforce the size ceiling.
+      - name: Download staged file
+        env:
+          FILE_URL: ${{ github.event.client_payload.file_url }}
+        run: |
+          # Blob path for the manifest = presigned URL minus the query string.
+          # NEVER store the full FILE_URL — the query string IS the auth token.
+          BLOB_PATH="${FILE_URL%%\?*}"
+          echo "BLOB_PATH=${BLOB_PATH}" >> "$GITHUB_ENV"
+
+          if [ "$NEEDS_CONVERT" = "skip" ]; then
+            printf '%s\n' "{\"blob_path\":\"$BLOB_PATH\",\"import_path\":\"\",\"converted\":\"\",\"converted_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"status\":\"skipped_unknown_extension\",\"chars\":0}" >> ingest-manifest.jsonl
+            echo "## ⚠️ File NOT ingested (unknown extension)" >> $GITHUB_STEP_SUMMARY
+            echo "\`${{ github.event.client_payload.filename }}\` was received and recorded in the manifest, but no converter exists for this type. The original remains in Blob Storage at \`$BLOB_PATH\`." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          if [ "$NEEDS_CONVERT" = "false" ]; then
+            TARGET="$RAW_PATH"
+          else
+            TARGET="$IMPORT_PATH"
+          fi
+          mkdir -p "$(dirname "$TARGET")"
+          # URL-encode spaces in the blob path (query string is already encoded by the storage provider).
+          FILE_URL_SAFE=$(echo "$FILE_URL" | sed 's/ /%20/g')
+          curl -f "$FILE_URL_SAFE" > "$TARGET"
+          echo "Downloaded: $TARGET ($(wc -c < "$TARGET") bytes)"
+
+          # Size ceiling on the text path only — binary path has its own gate.
+          MAX_BYTES=300000
+          if [ "$NEEDS_CONVERT" = "false" ]; then
+            SIZE=$(wc -c < "$TARGET")
+            if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+              echo "::error::Text file is ${SIZE} bytes (> ${MAX_BYTES}) — too large to ingest whole"
+              printf '%s\n' "{\"blob_path\":\"$BLOB_PATH\",\"import_path\":\"\",\"converted\":\"$RAW_PATH\",\"converted_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"status\":\"oversize_needs_review\",\"chars\":$SIZE}" >> ingest-manifest.jsonl
+              rm -f "$RAW_PATH"
+              echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+              echo "## ⚠️ File NOT ingested (oversize)" >> $GITHUB_STEP_SUMMARY
+              echo "\`${{ github.event.client_payload.filename }}\` is ${SIZE} bytes — exceeds the ingest ceiling. Original remains in Blob Storage at \`$BLOB_PATH\`." >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      # ── 3. Install Claude Code CLI (binary conversion only) ──────────────────
+      - name: Get Claude CLI version
+        id: cli
+        if: env.NEEDS_CONVERT == 'true'
+        run: echo "version=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Claude CLI
+        id: cli-cache
+        if: env.NEEDS_CONVERT == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: claude-cli-${{ runner.os }}-${{ steps.cli.outputs.version }}
+
+      - name: Install Claude Code CLI
+        if: env.NEEDS_CONVERT == 'true' && steps.cli-cache.outputs.cache-hit != 'true'
+        run: npm install -g --prefix ~/.npm-global @anthropic-ai/claude-code
+
+      - name: Add Claude CLI to PATH
+        if: env.NEEDS_CONVERT == 'true'
+        run: echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      # ── 2c. Pre-transform binary files ────────────────────────────────────
+      - name: Set up uv (for binary skills)
+        if: env.NEEDS_CONVERT == 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          # No cache-dependency-glob — skills use uv run --with (inline deps, no lock file)
+
+      - name: Cache pandoc binary
+        if: env.NEEDS_CONVERT == 'true'
+        id: pandoc-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/pandoc
+          key: pandoc-${{ runner.os }}
+
+      - name: Install pandoc (for docx/pptx → Markdown conversion)
+        if: env.NEEDS_CONVERT == 'true' && steps.pandoc-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y --no-install-recommends pandoc
+
+      - name: Cache pdftotext binary
+        if: env.NEEDS_CONVERT == 'true'
+        id: poppler-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/pdftotext
+          key: poppler-${{ runner.os }}
+
+      - name: Install poppler-utils (for PDF → Markdown conversion)
+        if: env.NEEDS_CONVERT == 'true' && steps.poppler-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y --no-install-recommends poppler-utils
+
+      - name: Accept Claude Code workspace trust
+        if: env.NEEDS_CONVERT == 'true'
+        run: |
+          mkdir -p /home/runner
+          printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$GITHUB_WORKSPACE" \
+            > /home/runner/.claude.json
+
+      - name: Run Claude Code pre-transform
+        if: env.NEEDS_CONVERT == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PROMPT="Use the binary-transform skill to convert '${IMPORT_PATH}' to Markdown at '${RAW_PATH}'. The Blob origin (for the manifest blob_path field) is '${BLOB_PATH}'. Follow the skill exactly."
+          echo "$PROMPT" | claude --print --allowedTools 'Skill,Read,Write,Bash'
+
+      # Verify gate: claude --print exits 0 even when the task failed internally.
+      # Do NOT exit 1 here — let the manifest entry get committed first; fail at backstop.
+      - name: Verify conversion output
+        if: env.NEEDS_CONVERT == 'true'
+        run: |
+          if [ ! -s "$RAW_PATH" ]; then
+            echo "::error::Conversion did not produce a usable file at $RAW_PATH — ingest will be skipped"
+            echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+            rm -f "$RAW_PATH"
+            echo "## ❌ Conversion failed" >> $GITHUB_STEP_SUMMARY
+            echo "\`$IMPORT_PATH\` could not be converted. Original remains in Blob Storage at \`$BLOB_PATH\`. See ingest-manifest.jsonl for the failure record." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          MAX_BYTES=300000
+          SIZE=$(wc -c < "$RAW_PATH")
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            echo "::error::Converted output is ${SIZE} bytes (> ${MAX_BYTES}) — ingest will be skipped"
+            echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+            printf '%s\n' "{\"blob_path\":\"$BLOB_PATH\",\"import_path\":\"$IMPORT_PATH\",\"converted\":\"$RAW_PATH\",\"converted_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"status\":\"oversize_needs_review\",\"chars\":$SIZE}" >> ingest-manifest.jsonl
+            rm -f "$RAW_PATH"
+            echo "## ⚠️ Converted but NOT ingested (oversize)" >> $GITHUB_STEP_SUMMARY
+            echo "Conversion of \`$IMPORT_PATH\` produced ${SIZE} bytes — exceeds the ingest ceiling. Original remains in Blob Storage at \`$BLOB_PATH\`." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          echo "Verified: $RAW_PATH (${SIZE} bytes)"
+
+      # ── 4. Create ingest branch ────────────────────────────────────────────
+      - name: Create ingest branch
+        id: branch
+        run: |
+          SLUG=$(echo "$FILE_PATH" \
+            | sed 's|/|-|g' \
+            | sed 's|\.[^.]*$||' \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9._-]/-/g' \
+            | sed 's/-\{2,\}/-/g' \
+            | sed 's/^-//;s/-$//')
+          BRANCH="ingest/${SLUG}-$(date +%Y%m%d%H%M%S)"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+      # ── 5. Detect changes ──────────────────────────────────────────────────
+      - name: Check for raw file changes
+        id: changes
+        run: |
+          git add raw/
+          [ -f ingest-manifest.jsonl ] && git add ingest-manifest.jsonl
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No raw file changes — nothing to commit."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            git diff --cached --name-only
+          fi
+
+      # ── 6a. Fast-path: push directly to main if no conflicts ───────────────
+      - name: Commit and push to main (no conflict)
+        if: steps.changes.outputs.has_changes == 'true'
+        id: push
+        env:
+          COMMIT_MSG: ${{ github.event.client_payload.commit_message }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          git config user.name  "wiki-ingest-bot"
+          git config user.email "wiki-ingest@noreply.github.com"
+
+          BASE_MSG="${COMMIT_MSG:-raw: ingest $FILE_PATH}"
+          git commit -m "$BASE_MSG" \
+            -m "" \
+            -m "X-Wiki-Workflow: ingest" \
+            -m "X-Raw-Source: $FILE_PATH"
+
+          # Retry up to 3 times to handle concurrent ingest race conditions.
+          # Each attempt rebases the ingest branch onto the latest origin/main
+          # so that a fast-forward push remains possible even when another
+          # ingest landed between our checkout and our push.
+          MAX_RETRIES=3
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt ${attempt}/${MAX_RETRIES}..."
+            git fetch origin main
+
+            # Rebase ingest branch onto latest main; bail to PR on conflict.
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "result=needs_pr" >> "$GITHUB_OUTPUT"
+              git checkout "$BRANCH"
+              git push origin "$BRANCH"
+              echo "Rebase conflict — opening conflict PR."
+              exit 0
+            fi
+
+            # Fast-forward local main to the rebased branch and push.
+            git checkout main
+            git reset --hard origin/main
+            if git merge --ff-only "$BRANCH" && git push origin main; then
+              echo "result=direct_push" >> "$GITHUB_OUTPUT"
+              echo "Pushed directly to main (attempt ${attempt})."
+              exit 0
+            fi
+
+            echo "Push rejected on attempt ${attempt} — retrying..."
+            git checkout "$BRANCH"
+          done
+
+          # All retries exhausted — fall back to PR.
+          echo "result=needs_pr" >> "$GITHUB_OUTPUT"
+          git push origin "$BRANCH"
+          echo "All retries exhausted — opening conflict PR."
+
+      # ── 6b. Conflict path: open a PR tagged needs-review ──────────────────
+      - name: Open conflict PR
+        if: steps.push.outputs.result == 'needs_pr'
+        id: pr
+        uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          SUBPATH: ${{ github.event.client_payload.subpath }}
+        with:
+          github-token: ${{ secrets.WIKI_PAT }}
+          script: |
+            const branch   = process.env.BRANCH;
+            const filePath = process.env.FILE_PATH;
+            const subpath  = process.env.SUBPATH || '(root)';
+
+            // Ensure label exists
+            const label = 'needs-review';
+            try {
+              await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label });
+            } catch {
+              await github.rest.issues.createLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label, color: 'e11d48', description: 'Wiki ingest conflict — needs human review before merge' });
+            }
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `raw: conflict ingest — ${filePath}`,
+              head:  branch,
+              base:  'main',
+              body: [
+                '## Wiki Ingest Conflict',
+                '',
+                `This PR was automatically opened because the ingest of \`${filePath}\` could not be fast-forward merged into \`main\`.`,
+                '',
+                '### Source metadata',
+                `| Field | Value |`,
+                `|---|---|`,
+                `| File | \`${filePath}\` |`,
+                `| Subpath | ${subpath} |`,
+                '',
+                '### What to do',
+                '1. Review the conflicting changes in the **Files changed** tab.',
+                '2. Resolve any contradictions or merge conflicts.',
+                '3. Remove the `needs-review` label when ready.',
+                '4. The `wiki-review` workflow will re-evaluate and merge automatically.',
+              ].join('\n'),
+            });
+
+            // pulls.create has no labels param — apply the label explicitly,
+            // otherwise the 'unlabeled' trigger in wiki-review.yml can never fire.
+            await github.rest.issues.addLabels({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: pr.data.number,
+              labels:       [label],
+            });
+
+            console.log(`PR #${pr.data.number} created: ${pr.data.html_url}`);
+            core.setOutput('pr_number', pr.data.number);
+            core.setOutput('pr_url', pr.data.html_url);
+
+      # ── Backstop: fail the job if conversion failed or was oversized ──────
+      # Must run AFTER the commit step so the manifest entry is safely committed
+      # before the job turns red (the dispatch caller sees this exit code).
+      - name: Fail job if conversion failed or output oversized
+        if: env.INGEST_BLOCKED == 'true'
+        run: |
+          echo "::error::File was not ingested (${NEEDS_CONVERT}) — manifest record committed"
+          exit 1
+
+      # ── 7. Job summary ─────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        env:
+          PUSH_RESULT: ${{ steps.push.outputs.result }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+        run: |
+          echo "## Wiki Ingest Result" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |"    >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|"            >> $GITHUB_STEP_SUMMARY
+          echo "| File | \`$FILE_PATH\` |" >> $GITHUB_STEP_SUMMARY
+          if [ "$PUSH_RESULT" = "direct_push" ]; then
+            echo "| Outcome | ✅ Raw file committed to main |" >> $GITHUB_STEP_SUMMARY
+          elif [ "$PUSH_RESULT" = "needs_pr" ]; then
+            echo "| Outcome | ⚠️ Conflict PR opened: $PR_URL |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Outcome | ℹ️ No raw file changes staged |" >> $GITHUB_STEP_SUMMARY
+          fi

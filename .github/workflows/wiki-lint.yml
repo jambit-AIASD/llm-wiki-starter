@@ -1,0 +1,232 @@
+# wiki-lint.yml
+# Whole-wiki health audit. Runs the LINT workflow defined in CLAUDE.md against
+# the full wiki/ tree on main — NOT against a diff.
+#
+# Why whole-corpus and not a PR gate:
+#   The checks that matter here (stale pages, zombie claims, structure-page
+#   currency, label rot, orphans) are aggregate invariants. They are invisible
+#   in any single ingest diff — the six-act cut of Draft 04 produced 18
+#   consecutive clean diffs while the wiki rotted underneath them. There is also
+#   no merge point to gate: wiki-curate.yml pushes straight to main.
+#
+# So this reports rather than blocks: findings land on one standing GitHub
+# issue that is updated in place (never a new issue per run) and closed
+# automatically once the wiki comes back clean.
+#
+# The check list lives in CLAUDE.md, not in this file. The prompt below
+# deliberately does not enumerate checks — that duplication is what let
+# wiki-review.yml's gate silently drift out of sync with the spec.
+
+name: Wiki Lint
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily, after the drafts sync and curate runs settle
+  workflow_dispatch:
+    inputs:
+      trigger_reason:
+        description: "Why this was dispatched (for logging/summary)"
+        required: false
+        type: string
+        default: "manual"
+
+# Serialize: two concurrent runs would race on the standing issue.
+# Schedule runs are parked in a throwaway group when the cron is disabled.
+concurrency:
+  group: ${{ github.event_name == 'schedule' && vars.WIKI_LINT_CRON_ENABLED != 'true' && format('cron-disabled-{0}', github.run_id) || 'wiki-lint' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  ISSUE_TITLE: "Wiki health — LINT findings"
+  ISSUE_LABEL: "wiki-lint"
+
+jobs:
+  cron-disabled:
+    name: Cron gate
+    if: github.event_name == 'schedule' && vars.WIKI_LINT_CRON_ENABLED != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log skip reason
+        run: |
+          echo "Cron skipped — WIKI_LINT_CRON_ENABLED is not set to 'true'."
+          echo "Set WIKI_LINT_CRON_ENABLED=true in repo variables to enable the daily lint cron." \
+            >> $GITHUB_STEP_SUMMARY
+
+  lint:
+    name: Lint the wiki
+    if: |
+      github.event_name != 'schedule' ||
+      vars.WIKI_LINT_CRON_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout main ───────────────────────────────────────────────────
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      # ── 2. Install Claude Code CLI (same cache strategy as wiki-curate) ────
+      - name: Get Claude CLI version
+        id: cli
+        run: echo "version=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Claude CLI
+        id: cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: claude-cli-${{ runner.os }}-${{ steps.cli.outputs.version }}
+
+      - name: Install Claude Code CLI
+        if: steps.cli-cache.outputs.cache-hit != 'true'
+        run: npm install -g --prefix ~/.npm-global @anthropic-ai/claude-code
+
+      - name: Add Claude CLI to PATH
+        run: echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Accept Claude Code workspace trust
+        run: |
+          mkdir -p /home/runner
+          printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$GITHUB_WORKSPACE" \
+            > /home/runner/.claude.json
+
+      # ── 3. Run the LINT workflow ───────────────────────────────────────────
+      # Read-only tools: this job must never mutate the wiki.
+      - name: Run Claude LINT
+        id: lint
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PROMPT="Read CLAUDE.md carefully, then perform the LINT workflow it defines (Workflows section, '3. LINT — Health-checking the wiki') against the entire wiki/ tree on this checkout.
+
+          This is the whole-corpus audit, not a diff review. Read the wiki broadly — index.md, log.md, overview.md, and the entity/concept/source pages — enough to evaluate every check in the CLAUDE.md LINT list, including the cross-page ones (stale pages, zombie claims, structure-page currency, label rot, orphans). Use Glob and Grep to sweep; do not assume a page is fine because you did not read it.
+
+          Apply exactly the check list and the safe/unsafe gate conditions defined in CLAUDE.md. Do not invent additional checks and do not relax the ones written there.
+
+          Respond with ONLY the JSON object, no markdown fences and no commentary:
+          {\"safe\": true|false, \"issues\": [\"...\"], \"summary\": \"...\"}
+
+          Each entry in issues should name the specific page(s) involved so a human can act on it without re-deriving the finding."
+
+          # A CLI failure must degrade to safe:false so the run surfaces rather
+          # than silently reporting a clean wiki.
+          RESULT=$(echo "$PROMPT" | claude --print --allowedTools 'Read,Glob,Grep') \
+            || RESULT='{"safe":false,"issues":["Claude CLI failed — check the workflow log"],"summary":"LINT failed to run"}'
+
+          # Salvage fenced output (```json ... ```) if the model adds fences.
+          printf '%s\n' "$RESULT" | sed -e '/^```/d' > /tmp/lint.json
+          echo "LINT result:"
+          cat /tmp/lint.json
+
+      # ── 4. Normalise result ────────────────────────────────────────────────
+      # Runs even if the previous step failed outright: an unparseable or
+      # missing result degrades to safe:false rather than passing silently.
+      - name: Normalise result
+        id: result
+        if: ${{ !cancelled() }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            let r;
+            try { r = JSON.parse(fs.readFileSync("/tmp/lint.json", "utf8")); } catch { r = null; }
+            if (!r || typeof r.safe !== "boolean")
+              r = { safe: false, issues: ["LINT produced no parseable JSON result"], summary: "" };
+            r.issues = Array.isArray(r.issues) ? r.issues : [];
+            r.summary = r.summary || "";
+            fs.writeFileSync("/tmp/lint-result.json", JSON.stringify(r));
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `safe=${r.safe}\n`);
+            const md = [
+              `## Wiki LINT — ${r.safe ? "✅ clean" : "⚠️ findings"}`,
+              "",
+              r.summary,
+              "",
+              ...r.issues.map(i => `- ${i}`),
+            ].join("\n");
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, md + "\n");
+            console.log(md);
+          '
+
+      # ── 5. Report to the standing issue ────────────────────────────────────
+      # One issue, updated in place. Unsafe -> open/update with findings.
+      # Safe -> comment and close if it was open; otherwise stay quiet.
+      - name: Update standing health issue
+        if: ${{ !cancelled() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const r = JSON.parse(fs.readFileSync('/tmp/lint-result.json', 'utf8'));
+            const title = process.env.ISSUE_TITLE;
+            const label = process.env.ISSUE_LABEL;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const stamp = new Date().toISOString().slice(0, 10);
+
+            // Ensure the label exists.
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: label });
+            } catch {
+              await github.rest.issues.createLabel({
+                ...context.repo, name: label, color: '0e8a16',
+                description: 'Whole-wiki LINT findings from wiki-lint.yml',
+              });
+            }
+
+            // Find the standing issue by label (open or closed, most recent).
+            const { data: found } = await github.rest.issues.listForRepo({
+              ...context.repo, labels: label, state: 'all',
+              sort: 'created', direction: 'desc', per_page: 20,
+            });
+            const existing = found.find(i => i.title === title && !i.pull_request);
+
+            const body = [
+              `_Last run: ${stamp} — [workflow run](${runUrl})_`,
+              '',
+              `**Status:** ${r.safe ? '✅ clean' : '⚠️ findings'}`,
+              '',
+              r.summary,
+              '',
+              r.issues.length ? '### Findings\n' + r.issues.map(i => `- ${i}`).join('\n') : '',
+              '',
+              '---',
+              '_Maintained by `wiki-lint.yml`. The check list lives in `CLAUDE.md` → Workflows → LINT._',
+            ].join('\n');
+
+            if (!r.safe) {
+              if (existing) {
+                await github.rest.issues.update({
+                  ...context.repo, issue_number: existing.number,
+                  body, state: 'open',
+                });
+                await github.rest.issues.createComment({
+                  ...context.repo, issue_number: existing.number,
+                  body: `🔁 **LINT re-run ${stamp}** — ${r.issues.length} finding(s) still open. [Run](${runUrl})`,
+                });
+                console.log(`Updated issue #${existing.number}`);
+              } else {
+                const { data: created } = await github.rest.issues.create({
+                  ...context.repo, title, body, labels: [label],
+                });
+                console.log(`Opened issue #${created.number}`);
+              }
+            } else if (existing && existing.state === 'open') {
+              await github.rest.issues.update({
+                ...context.repo, issue_number: existing.number, body,
+              });
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: existing.number,
+                body: `✅ **Wiki is clean as of ${stamp}** — closing. [Run](${runUrl})`,
+              });
+              await github.rest.issues.update({
+                ...context.repo, issue_number: existing.number, state: 'closed',
+              });
+              console.log(`Closed issue #${existing.number} — wiki clean`);
+            } else {
+              console.log('Wiki clean, no open health issue — nothing to report.');
+            }

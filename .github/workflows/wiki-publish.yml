@@ -1,0 +1,83 @@
+# wiki-publish.yml
+# Builds the Quartz static site as a validation/checkpoint step — no hosting
+# deploy. workflow_dispatch only — triggered by wiki-curate when the chain
+# completes or an N-threshold is crossed. Tags the build commit so wiki-curate
+# can count curations since the last publish checkpoint.
+#
+# To actually view the site: pull main and run `npx quartz build --serve`
+# (or `npm run index` then `npx quartz build --serve` from quartz/) locally.
+# See README.md "Local development".
+
+name: Wiki Publish
+run-name: "wiki-publish"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to push the publish tag
+
+jobs:
+  build:
+    name: Build Quartz (validation checkpoint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.WIKI_PAT }}
+
+      # ── 2. Set up Node ───────────────────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: quartz/package-lock.json
+
+      # ── 3. Install Quartz dependencies ───────────────────────────────────────
+      - name: Install Quartz dependencies
+        run: npm ci --prefix quartz
+
+      # ── 4. Symlink wiki content into quartz/content ──────────────────────────
+      - name: Link wiki content
+        run: |
+          rm -rf quartz/content
+          ln -s ../wiki quartz/content
+
+      # ── 5. Copy quartz config into quartz/ (loader reads from process.cwd()) ───
+      - name: Copy Quartz config
+        run: cp quartz.config.yaml quartz/quartz.config.yaml
+
+      # ── 6. Build Quartz site (validation only — output is not deployed anywhere) ──
+      - name: Build Quartz
+        run: |
+          cd quartz
+          npx quartz build \
+            --directory content \
+            --output public
+
+      # ── 7. Tag publish commit ───────────────────────────────────────────────
+      - name: Tag publish commit
+        run: |
+          git config user.name  "wiki-publish-bot"
+          git config user.email "wiki-publish@noreply.github.com"
+          TAG="wiki-publish/$(date -u +%Y%m%dT%H%M%SZ)"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Tagged: $TAG"
+
+      # ── 8. Summary ─────────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Wiki Publish Result" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | \`main\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Hosting | none — run `npx quartz build --serve` locally to view |" >> $GITHUB_STEP_SUMMARY

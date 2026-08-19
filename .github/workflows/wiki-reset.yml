@@ -1,0 +1,160 @@
+# wiki-reset.yml
+# Destructive reset — wipes wiki/ pages and all wiki-publish/* tags, then
+# commits a reset marker (X-Wiki-Workflow: reset). wiki-reset then explicitly
+# dispatches wiki-curate (the reset commit touches wiki/, not raw/**, so
+# wiki-curate's push trigger would not fire). wiki-curate's resolve step scopes
+# its stale check to commits after the reset marker, sees all raw/ files as
+# stale, and starts the curation chain immediately.
+#
+# Requires confirm='yes-reset' to prevent accidental triggers.
+
+name: Wiki Reset
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "yes-reset" to confirm (destructive — cannot be undone)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  reset:
+    name: Reset wiki to clean state
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Validate confirmation ───────────────────────────────────────────
+      - name: Validate confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "yes-reset" ]; then
+            echo "::error::Confirmation required. Set confirm='yes-reset' to proceed."
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+      # ── 2. Checkout main ───────────────────────────────────────────────────
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.WIKI_PAT }}
+
+      # ── 3. Clear wiki pages (restore stubs) ───────────────────────────────
+      - name: Clear wiki pages
+        run: |
+          # Remove all wiki pages but keep .gitkeep stubs
+          find wiki/sources wiki/entities wiki/concepts \
+            -name '*.md' ! -name '.gitkeep' -delete
+
+          # Reset wiki/index.md, wiki/overview.md, wiki/log.md to empty stubs
+          printf '# Wiki Index\n\n_Last updated: — | Total pages: 0 | Total sources: 0_\n\n## Sources\n\n## Entities\n\n## Concepts\n' \
+            > wiki/index.md
+          printf '' > wiki/overview.md
+          printf '' > wiki/log.md
+
+          echo "Wiki pages cleared."
+
+      # ── 4. Delete wiki-publish/* tags ─────────────────────────────────────
+      - name: Delete wiki-publish tags
+        run: |
+          git fetch --tags
+          TAGS=$(git tag --list 'wiki-publish/*')
+          if [ -z "$TAGS" ]; then
+            echo "No wiki-publish/* tags found — nothing to delete."
+          else
+            echo "$TAGS" | while read -r tag; do
+              git push origin --delete "$tag" \
+                && echo "Deleted remote tag: $tag" \
+                || echo "::warning::Could not delete remote tag $tag"
+              git tag -d "$tag"
+            done
+          fi
+
+      # ── 5. Commit reset marker and push ────────────────────────────────────
+      - name: Commit and push reset marker
+        id: push
+        run: |
+          git config user.name  "wiki-reset-bot"
+          git config user.email "wiki-reset@noreply.github.com"
+          git add wiki/
+
+          if git diff --cached --quiet; then
+            echo "Wiki already clean — nothing to commit."
+            echo "result=noop" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "wiki: reset to clean state" \
+            -m "" \
+            -m "X-Wiki-Workflow: reset" \
+            -m "X-Triggered-By: ${{ github.actor }}"
+
+          MAX_RETRIES=3
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt ${attempt}/${MAX_RETRIES}..."
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "result=failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Rebase conflict — manual intervention required"
+              exit 1
+            fi
+            if git push origin main; then
+              echo "result=pushed" >> "$GITHUB_OUTPUT"
+              echo "Pushed reset marker to main."
+              exit 0
+            fi
+          done
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+          echo "::error::All push retries exhausted"
+          exit 1
+
+      # ── 6. Dispatch wiki-curate to start fresh chain ─────────────────────
+      # Reset commit touches wiki/, NOT raw/** — so wiki-curate's push trigger
+      # (paths: ['raw/**']) does not fire. Explicit dispatch required.
+      # Pass the first stale raw file as file_path so the run name shows the
+      # source file (matching wiki-ingest-push behaviour). After a reset all raw
+      # files are stale, so the first alphabetical file is always correct here.
+      - name: Dispatch wiki-curate to start fresh chain
+        if: steps.push.outputs.result == 'pushed'
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_PAT }}
+        run: |
+          FIRST_FILE=$(git ls-files -- 'raw/' \
+            | grep '\.md$' \
+            | grep -v '^raw/assets/' \
+            | sort \
+            | head -1)
+          if [ -z "$FIRST_FILE" ]; then
+            echo "No raw files found — nothing to curate."
+            exit 0
+          fi
+          echo "Dispatching curate for first stale file: $FIRST_FILE"
+          gh workflow run wiki-curate.yml \
+            -f file_path="$FIRST_FILE" \
+            -f trigger_reason="post-reset"
+          echo "wiki-curate dispatched — chain will re-curate all raw files."
+
+      # ── 7. Job summary ─────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        env:
+          PUSH_RESULT: ${{ steps.push.outputs.result }}
+        run: |
+          echo "## Wiki Reset"                                           >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |"                                      >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|"                                               >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |"                 >> $GITHUB_STEP_SUMMARY
+          if [ "${PUSH_RESULT}" = "pushed" ]; then
+            echo "| Outcome | ✅ Reset complete — wiki-curate chain will re-curate all raw files |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${PUSH_RESULT}" = "noop" ]; then
+            echo "| Outcome | ℹ️ No changes — wiki was already clean |"  >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Outcome | ❌ Reset failed — check logs |"            >> $GITHUB_STEP_SUMMARY
+          fi

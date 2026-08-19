@@ -1,0 +1,38 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+*.swp
+*.swo
+
+# Obsidian — local tool, not committed
+.obsidian/
+
+# Temporary files
+*.tmp
+*.bak
+
+# Quartz build artefacts
+quartz/public/
+quartz/node_modules/
+quartz/.quartz-cache/
+quartz/quartz/.quartz-cache/
+quartz/.quartz/plugins/
+quartz/quartz.config.yaml
+
+# qmd search index (built in CI, not committed)
+.qmd-index/
+.qmd/
+wiki.sqlite
+
+# Ephemeral binary staging — originals live in Blob Storage
+import/
+
+# Python / skill deps
+.venv/
+**/node_modules/
+
+# binaries and generated files in subfolders
+**/gen/

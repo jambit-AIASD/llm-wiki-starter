@@ -1,0 +1,397 @@
+# wiki-ingest-issue.yml
+# GitHub-native alternative to wiki-ingest.yml's presigned-URL ingest path —
+# no external storage account required.
+#
+# Usage:
+#   1. Open an issue and label it "wiki-ingest".
+#   2. Either drag-and-drop ONE file into the issue body (pdf/docx/pptx/xlsx/
+#      html/md/txt/csv/json/xml/yaml/vtt/srt), or just write/paste Markdown
+#      content directly as the issue body (no attachment).
+#
+# Always lands under raw/issues/ (raw/issues/<slugified-title>-<issue-number>-<timestamp>.<ext>)
+# — an issue alone doesn't reliably indicate which show/topic a document
+# belongs to, so this workflow never guesses a subfolder, and it stays there
+# permanently (raw/ is immutable once written). The filename is derived from
+# the issue title, not the uploaded attachment's original name, so it stays
+# predictable and collision-free (the issue number disambiguates two issues
+# with the same title). The subpath/show_filter inputs on
+# wiki-ingest.yml/wiki-drafts-sync.yml are supplied explicitly by their
+# caller, unlike a human issue body.
+#
+# The workflow downloads/writes the content into raw/issues/, converts
+# binaries to Markdown via the binary-transform skill, commits with the
+# standard X-Wiki-Workflow/X-Raw-Source trailers, comments the result on the
+# issue, and closes it. Writes raw/ only — wiki-curate.yml picks it up via
+# the raw/** push trigger, same as wiki-ingest.yml.
+#
+# Limitation: only the first attachment in the issue body is used. Pasted
+# images (https://github.com/user-attachments/assets/<uuid>, no filename/type
+# in the URL) aren't supported — attach a document file or paste text instead.
+
+name: Wiki Ingest (Issue)
+run-name: "raw: ingest issue #${{ github.event.issue.number }}"
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  ingest:
+    name: Ingest issue content to raw/issues/
+    if: contains(github.event.issue.labels.*.name, 'wiki-ingest')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      NEEDS_CONVERT: ""
+      INGEST_BLOCKED: ""
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+          token: ${{ secrets.WIKI_PAT }}
+
+      # ── 2. Parse the issue: attachment URL/filename, or body-as-text ──────
+      - name: Parse issue
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+
+            // A single Markdown image/link pointing at a GitHub attachment:
+            //   [name](https://github.com/user-attachments/files/<id>/<filename>)  (dragged-in file — filename in URL)
+            //   ![alt](https://github.com/user-attachments/assets/<uuid>)          (pasted image — no filename/type in URL)
+            const attachmentRe = /!?\[[^\]]*\]\((https:\/\/github\.com\/user-attachments\/(?:files\/\d+\/[^)]+|assets\/[0-9a-f-]+))\)/i;
+            const match = body.match(attachmentRe);
+
+            let hasAttachment = false, attachmentUrl = '', originalFilename = '', isImageOnly = false;
+            if (match) {
+              hasAttachment = true;
+              attachmentUrl = match[1];
+              if (attachmentUrl.includes('/user-attachments/files/')) {
+                originalFilename = decodeURIComponent(attachmentUrl.split('/').pop());
+              } else {
+                isImageOnly = true;
+              }
+            }
+
+            const slug = (context.payload.issue.title || 'untitled')
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, '-')
+              .replace(/^-+|-+$/g, '') || 'untitled';
+            const ts = new Date(context.payload.issue.created_at).toISOString().slice(0, 19).replace(/[-:]/g, '') + 'Z';
+            const stem = `${slug}-${context.payload.issue.number}-${ts}`;
+            const ext = originalFilename.includes('.') ? originalFilename.split('.').pop() : 'md';
+
+            core.setOutput('has_attachment', String(hasAttachment));
+            core.setOutput('is_image_only', String(isImageOnly));
+            core.setOutput('attachment_url', attachmentUrl);
+            core.setOutput('filename', `${stem}.${ext}`);
+            core.setOutput('body_text', hasAttachment ? '' : body);
+
+      - name: Reject unsupported image-only attachment
+        if: steps.parse.outputs.is_image_only == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: "⚠️ Pasted-image attachments aren't supported yet — please attach a document file (pdf/docx/pptx/xlsx/html/md/txt/csv/json/xml/yaml/vtt/srt) or paste content directly as the issue body.",
+            });
+            core.setFailed('Image-only attachment — not ingestible.');
+
+      # ── 3. Route by extension (same rules as wiki-ingest.yml) ─────────────
+      - name: Route file to raw/ or import/
+        if: steps.parse.outputs.is_image_only != 'true'
+        env:
+          FILENAME: ${{ steps.parse.outputs.filename }}
+        run: |
+          EXT="${FILENAME##*.}"
+          EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+
+          TEXT_EXTS="md txt csv json xml yaml yml vtt srt"
+          BINARY_EXTS="pdf pptx docx xlsx html htm"
+
+          if echo "$TEXT_EXTS" | grep -qw "$EXT_LOWER"; then
+            RAW_PATH="raw/issues/${FILENAME}"
+            IMPORT_PATH=""
+            NEEDS_CONVERT="false"
+          elif echo "$BINARY_EXTS" | grep -qw "$EXT_LOWER"; then
+            RAW_PATH="raw/issues/${FILENAME}.md"
+            IMPORT_PATH="import/${FILENAME}"
+            NEEDS_CONVERT="true"
+          else
+            echo "::warning::Unknown extension '$EXT_LOWER' — file will not be ingested"
+            RAW_PATH=""
+            IMPORT_PATH=""
+            NEEDS_CONVERT="skip"
+          fi
+
+          echo "RAW_PATH=${RAW_PATH}"           >> "$GITHUB_ENV"
+          echo "IMPORT_PATH=${IMPORT_PATH}"     >> "$GITHUB_ENV"
+          echo "NEEDS_CONVERT=${NEEDS_CONVERT}" >> "$GITHUB_ENV"
+          echo "FILE_PATH=${RAW_PATH:-$IMPORT_PATH}" >> "$GITHUB_ENV"
+
+      - name: Reject unknown extension
+        if: env.NEEDS_CONVERT == 'skip'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: '⚠️ Unknown file type — not ingested. Supported: pdf, pptx, docx, xlsx, html, md, txt, csv, json, xml, yaml, vtt, srt.',
+            });
+            core.setFailed('Unknown extension — not ingestible.');
+
+      # ── 4a. Body-as-text path: write the issue body directly ─────────────
+      - name: Write issue body as raw Markdown
+        if: steps.parse.outputs.has_attachment != 'true' && env.NEEDS_CONVERT != 'skip'
+        env:
+          BODY: ${{ steps.parse.outputs.body_text }}
+        run: |
+          mkdir -p "$(dirname "$RAW_PATH")"
+          printf '%s\n' "$BODY" > "$RAW_PATH"
+          SIZE=$(wc -c < "$RAW_PATH")
+          echo "Wrote issue body to $RAW_PATH (${SIZE} bytes)"
+          MAX_BYTES=300000
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            echo "::error::Issue body is ${SIZE} bytes (> ${MAX_BYTES}) — too large to ingest whole"
+            rm -f "$RAW_PATH"
+            echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+          fi
+
+      # ── 4b. Attachment path: download it ──────────────────────────────────
+      # GitHub attachment URLs redirect to a signed storage URL. On private
+      # repos the initial request 404s without an authenticated identity, so
+      # pass WIKI_PAT as a bearer token.
+      - name: Download attachment
+        if: steps.parse.outputs.has_attachment == 'true' && env.NEEDS_CONVERT != 'skip'
+        env:
+          ATTACHMENT_URL: ${{ steps.parse.outputs.attachment_url }}
+          WIKI_PAT: ${{ secrets.WIKI_PAT }}
+        run: |
+          TARGET="$IMPORT_PATH"
+          [ "$NEEDS_CONVERT" = "false" ] && TARGET="$RAW_PATH"
+          mkdir -p "$(dirname "$TARGET")"
+          curl -fL -H "Authorization: Bearer ${WIKI_PAT}" "$ATTACHMENT_URL" -o "$TARGET"
+          SIZE=$(wc -c < "$TARGET")
+          echo "Downloaded: $TARGET (${SIZE} bytes)"
+          MAX_BYTES=300000
+          if [ "$NEEDS_CONVERT" = "false" ] && [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            echo "::error::File is ${SIZE} bytes (> ${MAX_BYTES}) — too large to ingest whole"
+            rm -f "$TARGET"
+            echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+          fi
+
+      # ── 5. Install Claude Code CLI (binary conversion only) ────────────────
+      - name: Get Claude CLI version
+        id: cli
+        if: env.NEEDS_CONVERT == 'true'
+        run: echo "version=$(npm view @anthropic-ai/claude-code version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Claude CLI
+        id: cli-cache
+        if: env.NEEDS_CONVERT == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: claude-cli-${{ runner.os }}-${{ steps.cli.outputs.version }}
+
+      - name: Install Claude Code CLI
+        if: env.NEEDS_CONVERT == 'true' && steps.cli-cache.outputs.cache-hit != 'true'
+        run: npm install -g --prefix ~/.npm-global @anthropic-ai/claude-code
+
+      - name: Add Claude CLI to PATH
+        if: env.NEEDS_CONVERT == 'true'
+        run: echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
+      - name: Set up uv (for binary skills)
+        if: env.NEEDS_CONVERT == 'true'
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Cache pandoc binary
+        if: env.NEEDS_CONVERT == 'true'
+        id: pandoc-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/pandoc
+          key: pandoc-${{ runner.os }}
+
+      - name: Install pandoc (for docx/pptx → Markdown conversion)
+        if: env.NEEDS_CONVERT == 'true' && steps.pandoc-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y --no-install-recommends pandoc
+
+      - name: Cache pdftotext binary
+        if: env.NEEDS_CONVERT == 'true'
+        id: poppler-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/bin/pdftotext
+          key: poppler-${{ runner.os }}
+
+      - name: Install poppler-utils (for PDF → Markdown conversion)
+        if: env.NEEDS_CONVERT == 'true' && steps.poppler-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get install -y --no-install-recommends poppler-utils
+
+      - name: Accept Claude Code workspace trust
+        if: env.NEEDS_CONVERT == 'true'
+        run: |
+          mkdir -p /home/runner
+          printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$GITHUB_WORKSPACE" \
+            > /home/runner/.claude.json
+
+      - name: Run Claude Code pre-transform
+        if: env.NEEDS_CONVERT == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PROMPT="Use the binary-transform skill to convert '${IMPORT_PATH}' to Markdown at '${RAW_PATH}'. The origin (for the manifest blob_path field) is the GitHub issue attachment URL: '${{ steps.parse.outputs.attachment_url }}'. Follow the skill exactly."
+          echo "$PROMPT" | claude --print --allowedTools 'Skill,Read,Write,Bash'
+
+      - name: Verify conversion output
+        if: env.NEEDS_CONVERT == 'true'
+        run: |
+          if [ ! -s "$RAW_PATH" ]; then
+            echo "::error::Conversion did not produce a usable file at $RAW_PATH — ingest will be skipped"
+            echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+            rm -f "$RAW_PATH"
+            exit 0
+          fi
+          MAX_BYTES=300000
+          SIZE=$(wc -c < "$RAW_PATH")
+          if [ "$SIZE" -gt "$MAX_BYTES" ]; then
+            echo "::error::Converted output is ${SIZE} bytes (> ${MAX_BYTES}) — ingest will be skipped"
+            echo "INGEST_BLOCKED=true" >> "$GITHUB_ENV"
+            rm -f "$RAW_PATH"
+            exit 0
+          fi
+          echo "Verified: $RAW_PATH (${SIZE} bytes)"
+
+      # ── 6. Commit and push to main (rebase-retry, same as wiki-ingest.yml) ─
+      - name: Commit and push to main
+        if: env.INGEST_BLOCKED != 'true' && env.NEEDS_CONVERT != 'skip'
+        id: push
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          git config user.name  "wiki-ingest-bot"
+          git config user.email "wiki-ingest@noreply.github.com"
+
+          git add raw/
+          if git diff --cached --quiet; then
+            echo "result=no_changes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "raw: ingest $FILE_PATH (issue #${ISSUE_NUMBER})" \
+            -m "" \
+            -m "X-Wiki-Workflow: ingest" \
+            -m "X-Raw-Source: $FILE_PATH" \
+            -m "X-Issue: #${ISSUE_NUMBER}"
+
+          BRANCH="ingest/issue-${ISSUE_NUMBER}-$(date +%Y%m%d%H%M%S)"
+          MAX_RETRIES=3
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Push attempt ${attempt}/${MAX_RETRIES}..."
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              git checkout -b "$BRANCH"
+              git push origin "$BRANCH"
+              echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+              echo "result=needs_pr" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if git push origin main; then
+              echo "result=direct_push" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Push rejected on attempt ${attempt} — retrying..."
+          done
+
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "result=needs_pr" >> "$GITHUB_OUTPUT"
+
+      - name: Open conflict PR
+        if: steps.push.outputs.result == 'needs_pr'
+        uses: actions/github-script@v7
+        env:
+          BRANCH: ${{ steps.push.outputs.branch }}
+        with:
+          github-token: ${{ secrets.WIKI_PAT }}
+          script: |
+            const branch = process.env.BRANCH;
+            const label = 'needs-review';
+            try {
+              await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label });
+            } catch {
+              await github.rest.issues.createLabel({ owner: context.repo.owner, repo: context.repo.repo, name: label, color: 'e11d48', description: 'Wiki ingest conflict — needs human review before merge' });
+            }
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner, repo: context.repo.repo,
+              title: `raw: conflict ingest — issue #${context.payload.issue.number}`,
+              head: branch, base: 'main',
+              body: `This PR was opened because the ingest from issue #${context.payload.issue.number} could not be fast-forward merged into \`main\`. Resolve conflicts, then remove the \`needs-review\` label.`,
+            });
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: pr.data.number, labels: [label],
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `⚠️ Ingest hit a merge conflict — opened ${pr.data.html_url} for review.`,
+            });
+
+      # ── 7. Comment result and close the issue on success ──────────────────
+      - name: Comment result and close issue
+        if: steps.push.outputs.result == 'direct_push'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `✅ Ingested to \`${process.env.FILE_PATH}\`. wiki-curate.yml will pick it up shortly.`,
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              state: 'closed',
+            });
+
+      # ── Backstop: fail the job if ingest was blocked ──────────────────────
+      - name: Fail job if ingest was blocked
+        if: env.INGEST_BLOCKED == 'true' || env.NEEDS_CONVERT == 'skip'
+        run: |
+          echo "::error::Issue #${{ github.event.issue.number }} was not ingested"
+          exit 1
+
+      # ── 8. Job summary ─────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        env:
+          PUSH_RESULT: ${{ steps.push.outputs.result }}
+        run: |
+          echo "## Wiki Ingest (Issue) Result" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |"    >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|"            >> $GITHUB_STEP_SUMMARY
+          echo "| Issue | #${{ github.event.issue.number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| File | \`${FILE_PATH:-n/a}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Outcome | ${PUSH_RESULT:-blocked} |" >> $GITHUB_STEP_SUMMARY

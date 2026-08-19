@@ -1,0 +1,10 @@
+{
+  "name": "llm-wiki",
+  "private": true,
+  "scripts": {
+    "index": "bash scripts/setup-dev.sh",
+    "wiki:install": "npm ci --prefix quartz",
+    "wiki:link": "rm -rf quartz/content && ln -s ../wiki quartz/content && cp quartz.config.yaml quartz/quartz.config.yaml",
+    "wiki:serve": "npm run wiki:link && cd quartz && npx quartz build --serve"
+  }
+}

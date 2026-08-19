@@ -1,0 +1,54 @@
+name: Sync Wiki Toolchain
+
+# Manual dispatch only, deliberately — there is no schedule.
+#
+# Syncing is event-driven: it belongs to provisioning a new instance, or to a
+# considered toolchain change you want propagated now. A calendar trigger fits
+# neither. It also had three concrete problems:
+#   - the target branch is date-stamped (sync/toolchain-<YYYYMMDD>), so each firing
+#     opens a NEW PR instead of updating the last one — unmerged sync PRs pile up
+#     across every target repo;
+#   - it burned WIKI_PAT on cross-repo writes unattended, with nobody watching;
+#   - this workflow is itself synced to instance repos, so every instance
+#     inherited the cron. Harmless only while its target list stayed empty — one
+#     stray repo variable would have turned an instance into a sync source.
+#
+# Propagate a toolchain change by dispatching this once per target (dry_run first).
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Target repo(s), space-separated (e.g. myorg/wiki-instance-a myorg/wiki-instance-b)"
+        required: true
+      dry_run:
+        description: "Dry run — diff only, no push or PR"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SOURCE
+        uses: actions/checkout@v4
+        with:
+          path: ${{ github.event.repository.name }}
+
+      - name: Run sync for each target
+        env:
+          WIKI_PAT: ${{ secrets.WIKI_PAT }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          TARGETS: ${{ inputs.target_repo }}
+          SRC_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          # Unquoted on purpose: word-splits a space-separated target list.
+          for target in $TARGETS; do
+            echo "==> Syncing to $target"
+            bash "$SRC_NAME/scripts/sync-wiki.sh" \
+              --source "$(pwd)/$SRC_NAME" \
+              --target-repo "$target" \
+              --pat "$WIKI_PAT" \
+              $( [ "$DRY_RUN" = "true" ] && echo "--dry-run" )
+          done

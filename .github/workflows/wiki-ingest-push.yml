@@ -1,0 +1,110 @@
+# wiki-ingest-push.yml
+# Triggered by: push to raw/** (new or updated raw markdown files).
+#
+# Resolves the first stale raw file and dispatches a wiki-curate workflow_dispatch
+# for it. Every actual curation run is therefore a workflow_dispatch and carries
+# the correct file_path in its run name.
+#
+# This workflow is intentionally lightweight — checkout, stale-file scan, dispatch.
+# All curation logic lives in wiki-curate.yml.
+
+name: Wiki Ingest Push
+run-name: "wiki-ingest-push: raw push signal"
+
+on:
+  push:
+    branches: [main]
+    paths: ['raw/**']
+
+concurrency:
+  group: wiki-ingest-push
+  cancel-in-progress: false   # queue pushes; each may reveal a different stale file
+
+permissions:
+  contents: read
+
+jobs:
+  kickoff:
+    name: Kickoff curate chain from push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.WIKI_PAT }}
+
+      - name: Find first stale file
+        id: resolve
+        run: |
+          git ls-files -- 'raw/' \
+            | grep '\.md$' \
+            | grep -v '^raw/assets/' \
+            | sort > /tmp/all_raw.txt
+
+          RESET_SHA=$(git log --format='%H' --grep='X-Wiki-Workflow: reset' | head -1)
+          RANGE="${RESET_SHA:+${RESET_SHA}..HEAD}"
+
+          FILE_PATH=""
+          while IFS= read -r F; do
+            LAST_INGEST=$(git log --format='%ct' \
+              --grep="X-Wiki-Workflow: ingest" --grep="X-Raw-Source: ${F}" \
+              --all-match | head -1)
+            LAST_CURATE=$(git log ${RANGE} --format='%ct' \
+              --grep="X-Wiki-Workflow: curate" --grep="X-Raw-Source: ${F}" \
+              --all-match | head -1)
+            if [ -z "$LAST_CURATE" ] || [ "${LAST_INGEST:-0}" -gt "${LAST_CURATE:-0}" ]; then
+              FILE_PATH="$F"
+              break
+            fi
+          done < /tmp/all_raw.txt
+
+          if [ -z "$FILE_PATH" ]; then
+            echo "No stale files found — nothing to dispatch."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dispatching curate for: $FILE_PATH"
+            printf '%s\n' "$FILE_PATH" > /tmp/curate_file.txt
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if curate chain is already active
+        id: chain-check
+        if: steps.resolve.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_PAT }}
+        run: |
+          IN_PROGRESS=$(gh run list --workflow=wiki-curate.yml --status=in_progress --json databaseId --jq 'length')
+          QUEUED=$(gh run list      --workflow=wiki-curate.yml --status=queued      --json databaseId --jq 'length')
+          if [ $((IN_PROGRESS + QUEUED)) -gt 0 ]; then
+            echo "wiki-curate already active ($IN_PROGRESS running, $QUEUED queued) — chain will pick up new files."
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "active=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch curate run
+        if: steps.resolve.outputs.skip != 'true' && steps.chain-check.outputs.active != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_PAT }}
+        run: |
+          FILE=$(cat /tmp/curate_file.txt)
+          gh workflow run wiki-curate.yml \
+            -f file_path="$FILE" \
+            -f trigger_reason="chain"
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Wiki Ingest Push" >> $GITHUB_STEP_SUMMARY
+          if [ -f /tmp/curate_file.txt ]; then
+            FILE=$(cat /tmp/curate_file.txt)
+            if [ "${{ steps.chain-check.outputs.active }}" = "true" ]; then
+              echo "Chain already active — \`$FILE\` will be picked up automatically." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "Chain dispatched for \`$FILE\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "No stale files found — nothing to dispatch." >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,32 @@
+{
+  "model": "claude-sonnet-4-6",
+  "enableAllProjectMcpServers": true,
+  "permissions": {
+    "allow": [
+      "Read(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "Edit(wiki/**)",
+      "Bash(git diff*)",
+      "Bash(git status*)",
+      "Bash(git log*)",
+      "Bash(git add*)",
+      "Bash(git commit*)",
+      "Bash(git checkout*)",
+      "Bash(git fetch*)",
+      "Bash(git merge*)",
+      "Bash(git push*)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(base64 *)",
+      "Bash(pandoc *)",
+      "mcp__qmd__query",
+      "mcp__qmd__get",
+      "mcp__qmd__multi_get",
+      "mcp__qmd__status",
+      "ToolSearch"
+    ]
+  }
+}

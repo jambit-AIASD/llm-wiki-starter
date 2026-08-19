@@ -1,0 +1,8 @@
+@use "./variables.scss" as *;
+
+// put your custom CSS here!
+
+// Add bullet points to Explorer sidebar page items (not folder headings)
+.explorer ul ul {
+  list-style: circle inside;
+}

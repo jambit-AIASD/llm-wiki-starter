@@ -1,0 +1,9 @@
+{
+  "name": "docx-skill",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dependencies for generating .docx files with the docx library",
+  "dependencies": {
+    "docx": "^9.7.1"
+  }
+}
