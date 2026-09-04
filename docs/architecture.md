@@ -85,6 +85,9 @@ New source documents arrive in `raw/`. Three entry points:
   provider works — S3, GCS, self-hosted MinIO, etc.), routing text straight to
   `raw/` and converting binaries to Markdown via the `binary-transform` skill
   first. An optional `subpath` organizes the file as `raw/<subpath>/…`.
+- On a merge conflict, ingest opens a PR tagged `needs-review`. `wiki-review.yml`
+  re-lints the wiki diff with the AI agent when the label is removed (or the PR
+  is approved) and auto-merges if clean.
 
 ### 2. Curate → `wiki/`
 
@@ -94,9 +97,6 @@ New source documents arrive in `raw/`. Three entry points:
   INGEST workflow in `CLAUDE.md`, commits the resulting `wiki/` changes, then
   self-re-triggers until the backlog is clear. A safety-net cron also runs
   (gated by the `WIKI_CURATE_CRON_ENABLED` repo variable).
-- On a merge conflict, ingest opens a PR tagged `needs-review`. `wiki-review.yml`
-  re-lints the wiki diff with the AI agent when the label is removed (or the PR
-  is approved) and auto-merges if clean.
 
 ### 3. Publish → local static site
 
@@ -113,15 +113,20 @@ New source documents arrive in `raw/`. Three entry points:
 
 ```mermaid
 flowchart LR
-    A[Source doc] -->|push, issue, or dispatch| B[raw/]
+    A[Source doc] -->|push, issue, or dispatch| IN[wiki-ingest<br/>/ ingest-issue]
+    A2[krt-scripts-mirror] -->|daily cron: wiki-drafts-sync| B[raw/]
+    IN -->|no conflict| B
+    IN -->|rebase fails| PR[PR: needs-review]
+    PR -->|label removed / approved| E[wiki-review]
+    E -->|merge| B
     B -->|raw/** push| C[wiki-ingest-push]
     C -->|dispatch| D[wiki-curate<br/>AI agent]
     D -->|chain| D
-    D -->|conflict PR| E[wiki-review]
-    E -->|merge| F[wiki/]
-    D -->|clean| F
+    D -->|clean| F[wiki/]
     F -->|chain complete / batch| G[wiki-publish<br/>build checkpoint]
     G --> H[quartz build --serve<br/>local]
+    F -.->|daily cron / manual| L[wiki-lint]
+    L -.->|findings| M[standing issue]
 ```
 
 ---
