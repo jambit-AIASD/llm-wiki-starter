@@ -83,6 +83,7 @@ rsync -a --delete \
   --exclude='docs/'                 \
   --exclude='quartz/'               \
   --exclude='scripts/'              \
+  --exclude='templates/'            \
   --exclude='README.md'             \
   --filter='- */'                   \
   "$SOURCE/" "$TGT/"

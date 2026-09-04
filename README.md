@@ -67,7 +67,7 @@ covers everything domain-specific.
 | Secret | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | AI agent (curate, review workflows) |
-| `WIKI_PAT` | Cross-workflow Git operations and PRs |
+| `WIKI_PAT` | Cross-workflow Git operations and PRs — create at GitHub → Settings → Developer settings → Personal Access Tokens → Tokens (classic); grant `repo` and `workflow` scopes |
 
 **Variables** (Settings → Variables → Actions):
 
@@ -167,6 +167,22 @@ Stop the server with Ctrl+C. Re-run `npx quartz build --serve` any time after
 ```bash
 npm run index   # bash scripts/setup-dev.sh — qmd init/update/embed
 ```
+
+### Convert between Markdown and Office / PDF formats
+
+Claude Code skills convert in both directions — binary files to Markdown for
+ingest into `raw/`, and Markdown (or wiki content) back to a formatted document
+using a template. Run any skill with `/` in an interactive Claude Code session:
+
+| Skill | To Markdown | From Markdown |
+|---|---|---|
+| `/pdf` | Extract text and images from a PDF | — |
+| `/pptx` | Extract slide content to Markdown | Generate a `.pptx` from wiki content + template |
+| `/docx` | Extract a Word document to Markdown | Generate a `.docx` from wiki content + template |
+| `/xlsx` | Extract spreadsheet tables to Markdown | — |
+
+See [README_DOC_TOOLS.md](README_DOC_TOOLS.md) for full usage, template support,
+and the `binary-transform` skill that writes converted files directly into `raw/`.
 
 ---
 

@@ -22,13 +22,21 @@ quartz/quartz/.quartz-cache/
 quartz/.quartz/plugins/
 quartz/quartz.config.yaml
 
+# Claude Code Skill docx, pptx Template
+templates/*
+!templates/README.md
+
 # qmd search index (built in CI, not committed)
 .qmd-index/
 .qmd/
 wiki.sqlite
 
-# Ephemeral binary staging — originals live in Blob Storage
+# Ephemeral binary staging
 import/
+
+# Documents
+docs/*
+!docs/**/*.md
 
 # Python / skill deps
 .venv/
