@@ -41,10 +41,12 @@ index, and toolchain sync details.
 
 ## Getting started
 
-### 1. Fork or copy this repo
+### 1. Create a new repo from this template
 
-Use it as the base for a new wiki instance. Each instance is an independent
-repo with its own `raw/` and `wiki/`.
+Click **Use this template → Create a new repository** on GitHub to create your
+own wiki instance. Set visibility to **Private** — wikis typically contain
+internal or proprietary content. Each instance is an independent repo with its
+own `raw/` and `wiki/`.
 
 **Domain skills** configure what kind of wiki this is — entity types, concept
 types, page structure conventions, and any ingest extensions. Two skills are
