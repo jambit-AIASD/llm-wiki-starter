@@ -149,19 +149,24 @@ Quartz reads its content and config relative to the `quartz/` directory, so
 link `wiki/` in and copy the config before building — same steps
 `wiki-publish.yml` runs in CI:
 
-```bash
-# Once, or after quartz/ dependencies change
-npm ci --prefix quartz
+<details>
+<summary>Manual steps</summary>
 
-# Point Quartz at the wiki content and its config
+```bash
+npm ci --prefix quartz
 rm -rf quartz/content && ln -s ../wiki quartz/content
 cp quartz.config.yaml quartz/quartz.config.yaml
-
-# Build + serve with hot reload at http://localhost:8080
 cd quartz && npx quartz build --serve
 ```
 
-Stop the server with Ctrl+C. Re-run `npx quartz build --serve` any time after
+</details>
+
+```bash
+npm run wiki:install   # once, or after quartz/ dependencies change
+npm run wiki:serve     # link wiki/, build, and serve at http://localhost:8080
+```
+
+Stop the server with Ctrl+C. Re-run `npm run wiki:serve` any time after
 `wiki/` changes — it also watches and rebuilds automatically while running.
 
 ### Rebuild the qmd search index
