@@ -1,7 +1,8 @@
 # llm-wiki-starter
 
 A general-purpose, domain-agnostic knowledge wiki inspired by Andrej Karpathy's
-[LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f).
+[LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) and configured for Claude Code out-of-the-box use.
+
 Drop source documents into `raw/` — by direct push or by opening a GitHub issue
 labeled `wiki-ingest` — and an AI agent curates them into an interlinked wiki
 under `wiki/`, which is published as a searchable static site.
@@ -174,6 +175,13 @@ Stop the server with Ctrl+C. Re-run `npm run wiki:serve` any time after
 ```bash
 npm run index   # bash scripts/setup-dev.sh — qmd init/update/embed
 ```
+
+The qmd MCP server is pre-configured in `.mcp.json` and loads automatically in
+Claude Code sessions. Claude can search the wiki directly without any manual
+steps — use natural language queries or commands like `Query: <question>` and
+Claude will call `mcp__qmd__query` (semantic/keyword search) and
+`mcp__qmd__get` (fetch a page) under the hood. Run `npm run index` after adding
+new wiki pages to keep the search index current.
 
 ### Convert between Markdown and Office / PDF formats
 
