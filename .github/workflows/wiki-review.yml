@@ -5,16 +5,8 @@
 # when it exhausts its rebase retries staging a file into raw/. When the tag is
 # REMOVED — or a review is submitted as approved — the PR is merged here.
 #
-# NOTE: these PRs contain raw/ and ingest-manifest.jsonl only (wiki-ingest.yml
-# does `git add raw/`); they never touch wiki/. A Claude Page-LINT gate used to
-# sit in this workflow, conditioned on the diff touching wiki/ — which for these
-# PRs is never true, so it never ran, and the empty result set made the merge
-# gate vacuously pass. It was removed 2026-08-15 as dead code.
-#
-# Wiki content is not gated here and does not need to be: wiki-curate.yml pushes
-# straight to main, so there is no PR to gate. Wiki health is audited whole-corpus
-# by wiki-lint.yml, which catches the cross-page rot a diff review structurally
-# cannot see.
+# Wiki content is not gated here: wiki-curate.yml pushes straight to main, so
+# there is no PR to gate. Wiki health is audited whole-corpus by wiki-lint.yml.
 
 name: Wiki Review
 
