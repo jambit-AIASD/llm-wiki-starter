@@ -31,7 +31,7 @@ The folder name is typically identical to the Teams channel name.
 Load these before starting (they may be deferred):
 
 ```
-ToolSearch("select:mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__computer,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__tabs_close_mcp,mcp__claude-in-chrome__read_network_requests,mcp__claude-in-chrome__javascript_tool")
+ToolSearch("select:mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__tabs_close_mcp,mcp__claude-in-chrome__javascript_tool")
 ```
 
 ---
@@ -62,16 +62,16 @@ uv run scripts/vtt_receiver.py docs/meetings 8765 &
 sleep 1 && echo "Server ready"
 ```
 
-### 2. Open a tab and query the REST API for the most recent recording
+### 2. Open a tab on the SharePoint site
 
-Navigate to the SharePoint site root:
+Navigate to the SharePoint site root (this establishes the authenticated session
+— all subsequent calls use `credentials: 'include'`):
 
 ```
 https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment
 ```
 
-Then call the SharePoint REST API to get the most recent `.mp4` filename and
-date — no need to read the file list visually:
+### 3. Get the most recent recording filename
 
 ```javascript
 // javascript_tool on that tab:
@@ -84,95 +84,69 @@ JSON.stringify(data?.d?.results?.[0])
 ```
 
 This gives you:
-- `Name` — the filename (e.g. `Planning AI Optimierung SDLC-20260910_133047UTC-Meeting Recording.mp4`)
+- `Name` — the filename (e.g. `Daily AI im SDLC-20260915_074514UTC-Meeting Recording.mp4`)
 - `TimeCreated` — the date
 
-Extract the date from the filename (`20260910` → `2026-09-10`) and slugify the
-title for the output filename (e.g. `2026-09-10-planning-ai-optimierung-sdlc.vtt`).
+Extract the date from the filename (`20260915` → `2026-09-15`) and slugify the
+title for the output filename (e.g. `2026-09-15-daily-ai-im-sdlc.vtt`).
 
-### 3. Navigate to the Recordings folder and click the file
+### 4. Resolve the driveId and itemId via REST API
 
-**Important:** Microsoft Stream only initializes its player when opened by a
-real SharePoint click. Direct `navigate` calls produce a broken "bypass" player
-with no controls. So after getting the filename via REST API, you must still
-open the Stream player via a click.
-
-Navigate this same tab to the Recordings folder:
-
-```
-https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment/Shared%20Documents/Forms/AllItems.aspx?viewid=b2882e63%2De68f%2D4da7%2Dbd47%2D2d3744b3a0c9&FolderCTID=0x012000D637A550FAAEED4493E0D5B875435A21&id=%2Fsites%2FPoC-AIAssistedSoftwareDevelopment%2FShared%20Documents%2F<CHANNEL_ENCODED>%2FRecordings
-```
-
-URL-encode the channel name (spaces → `%20`).
-
-Wait for the file list to load (zoom the content area to confirm). Then click
-the most recent `.mp4` row. Since you already know the filename from the REST
-API, you just need to click the first row. The click opens a new tab — get its
-ID from `tabs_context_mcp`.
-
-Back-calculate click coordinates from zoomed images:
-```
-x_real = x0 + (x_zoomed / output_width)  × (x1 - x0)
-y_real = y0 + (y_zoomed / output_height) × (y1 - y0)
-```
-
-After the click, the Recordings folder tab stays open until step 8 — do NOT
-close it yet. The extension uses it as the group anchor; closing it first
-orphans the Stream tab.
-
-### 4. Enable network monitoring, pause video, open Transcript
-
-On the Stream player tab:
-
-```
-read_network_requests(tabId=<stream-tab>, clear=true)
-```
-
-Pause the video immediately:
+The "Documents" drive (Shared Documents library) must be looked up by name:
 
 ```javascript
-// javascript_tool on the Stream player tab:
-const v = document.querySelector('video');
-if (v) { v.pause(); v.muted = true; }
-"paused"
+// javascript_tool on the same tab:
+const siteBase = "https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment";
+const channel = "<CHANNEL>";
+const filename = "<FILENAME>";  // from step 3, e.g. "Daily AI im SDLC-20260915_074514UTC-Meeting Recording.mp4"
+
+// 1. Find the "Documents" drive
+const drivesData = await fetch(`${siteBase}/_api/v2.1/drives?$select=id,name`, {
+  credentials: 'include', headers: {Accept: 'application/json'}
+}).then(r => r.json());
+const driveId = drivesData.value.find(d => d.name === 'Documents').id;
+
+// 2. Get itemId for the recording file
+const filePath = `${channel}/Recordings/${filename}`;
+const itemData = await fetch(
+  `${siteBase}/_api/v2.1/drives/${driveId}/root:/${encodeURIComponent(filePath)}?$select=id,name`,
+  {credentials: 'include', headers: {Accept: 'application/json'}}
+).then(r => r.json());
+
+JSON.stringify({driveId, itemId: itemData.id, name: itemData.name})
 ```
 
-Click the Transcript button via JavaScript:
+### 5. List transcripts and fetch the VTT
 
 ```javascript
-// javascript_tool on the Stream player tab:
-document.querySelector('button[aria-label="Transcript"]').click();
-"clicked"
-```
+// javascript_tool on the same tab:
+const siteBase = "https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment";
+// driveId and itemId from step 4
+const driveId = "<DRIVE_ID>";
+const itemId = "<ITEM_ID>";
 
-### 5. Capture the transcript URL
+const transcripts = await fetch(
+  `${siteBase}/_api/v2.1/drives/${driveId}/items/${itemId}/media/transcripts`,
+  {credentials: 'include', headers: {Accept: 'application/json'}}
+).then(r => r.json());
 
-```
-read_network_requests(tabId=<stream-tab>, urlPattern="transcript", limit=5)
-```
+// Use the default transcript (isDefault: true) or the first one
+const t = transcripts.value.find(t => t.isDefault) ?? transcripts.value[0];
+const transcriptUrl = `${siteBase}/_api/v2.1/drives/${driveId}/items/${itemId}/media/transcripts/${t.id}/streamContent?is=1&applymediaedits=false`;
 
-Extract `driveId`, `itemId`, and `transcriptkey` from the `cdnmedia/transcripts`
-request URL and build the streamContent URL:
-
-```
-https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment/_api/v2.1/drives/<driveId>/items/<itemId>/media/transcripts/<transcriptId>/streamContent?is=1&applymediaedits=false
-```
-
-### 6. Fetch in-page and POST to local server
-
-```javascript
-// javascript_tool on the Stream player tab:
-window.__vtt = await fetch('<transcript-url>', {credentials: 'include'}).then(r => r.text());
+window.__vtt = await fetch(transcriptUrl, {credentials: 'include'}).then(r => r.text());
 const filename = '<YYYY-MM-DD-slugified-title>.vtt';
 const resp = await fetch(`http://127.0.0.1:8765/${filename}`, {
   method: 'POST',
   headers: {'Content-Type': 'text/plain; charset=utf-8'},
   body: window.__vtt
 });
-await resp.text()  // should return "OK"
+`POST ${resp.status}: ${await resp.text()} | length: ${window.__vtt.length} | lang: ${t.languageTag}`
 ```
 
-### 7. Verify
+The response should be `POST 200: OK`.
+
+### 6. Verify
 
 ```bash
 ls -lh docs/meetings/<slug>.vtt
@@ -180,16 +154,15 @@ ls -lh docs/meetings/<slug>.vtt
 
 If a file already exists at that path, report it and ask before replacing.
 
-### 8. Clean up
+### 7. Clean up
 
-Close tabs in this order — Stream tab first, then Recordings tab:
+Close the SharePoint tab:
 ```
-tabs_close_mcp(tabId=<stream-tab>)
-tabs_close_mcp(tabId=<recordings-tab>)
+tabs_close_mcp(tabId=<tab>)
 ```
 The receiver server shuts itself down after one POST.
 
-### 9. Report
+### 8. Report
 
 Report the destination path and meeting title/date to the user.
 
@@ -198,10 +171,8 @@ Report the destination path and meeting title/date to the user.
 ## Constraints
 
 - **Never open Teams** — go straight to SharePoint.
-- **Do not use `navigate` to open the Stream player** — it produces a broken
-  "bypass" player. The file must be opened via a click in the SharePoint file
-  list (step 3). The Recordings folder tab can be closed immediately after the
-  click opens the Stream player tab.
+- **No Stream player needed** — the transcript is fetched entirely via REST API.
+  Do not navigate to the Recordings folder or click any file.
 - Never modify or ingest anything outside `docs/meetings/`.
 - The receiver server handles one request then exits. Restart it if running the
   skill more than once in a session.
