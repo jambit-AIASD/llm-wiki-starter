@@ -32,7 +32,8 @@ local site      static HTML, served on demand with `quartz build --serve`
   hosting account is required anywhere in this pipeline.
 
 See [docs/architecture.md](docs/architecture.md) for the full pipeline, search
-index, and toolchain sync details.
+index, and toolchain sync details. For a detailed walkthrough of setup and
+day-to-day usage, see [docs/how-to/use-this-wiki.md](docs/how-to/use-this-wiki.md).
 
 > **Fastest way to add content:** open an issue on this repo, label it
 > `wiki-ingest`, and either attach a file or paste Markdown as the body. See
@@ -196,7 +197,7 @@ using a template. Run any skill with `/` in an interactive Claude Code session:
 | `/docx` | Extract a Word document to Markdown | Generate a `.docx` from wiki content + template |
 | `/xlsx` | Extract spreadsheet tables to Markdown | — |
 
-See [README_DOC_TOOLS.md](README_DOC_TOOLS.md) for full usage, template support,
+See [transform-office-documents.md](docs/how-to/transform-office-documents.md) for full usage, template support,
 and the `binary-transform` skill that writes converted files directly into `raw/`.
 
 ---
