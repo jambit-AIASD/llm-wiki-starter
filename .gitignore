@@ -35,7 +35,8 @@ wiki.sqlite
 import/
 
 # Documents
-docs/*
+docs/**
+!docs/**/
 !docs/**/*.md
 
 # Python / skill deps
