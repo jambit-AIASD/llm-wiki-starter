@@ -2,8 +2,8 @@
 name: fetch-recording-transcript
 description: >
   On-demand: navigate directly to SharePoint, find the most recent recording in
-  the channel's Recordings folder, and write its .vtt transcript straight into
-  docs/meetings/ — no Teams, no browser download dialog, no Downloads folder.
+  the channel's Recordings folder, and write its .vtt transcript into
+  docs/meetings/ — no Teams, no Stream player needed.
 ---
 
 # Fetch Recording Transcript
@@ -55,14 +55,7 @@ This complements the isolated browser profile and least-privilege account — it
 
 ## Step-by-step procedure
 
-### 1. Start the local receiver server
-
-```bash
-uv run scripts/vtt_receiver.py docs/meetings 8765 &
-sleep 1 && echo "Server ready"
-```
-
-### 2. Open a tab on the SharePoint site
+### 1. Open a tab on the SharePoint site
 
 Navigate to the SharePoint site root (this establishes the authenticated session
 — all subsequent calls use `credentials: 'include'`):
@@ -71,7 +64,7 @@ Navigate to the SharePoint site root (this establishes the authenticated session
 https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment
 ```
 
-### 3. Get the most recent recording filename
+### 2. Get the most recent recording filename
 
 ```javascript
 // javascript_tool on that tab:
@@ -90,7 +83,7 @@ This gives you:
 Extract the date from the filename (`20260915` → `2026-09-15`) and slugify the
 title for the output filename (e.g. `2026-09-15-daily-ai-im-sdlc.vtt`).
 
-### 4. Resolve the driveId and itemId via REST API
+### 3. Resolve the driveId and itemId via REST API
 
 The "Documents" drive (Shared Documents library) must be looked up by name:
 
@@ -116,53 +109,61 @@ const itemData = await fetch(
 JSON.stringify({driveId, itemId: itemData.id, name: itemData.name})
 ```
 
-### 5. List transcripts and fetch the VTT
+### 4. List transcripts, fetch the VTT, and trigger download
+
+Chrome's HTTPS content-security policy blocks fetches from SharePoint to
+`http://localhost`, so the transcript is saved via a blob-URL download instead
+of a local receiver server.
 
 ```javascript
 // javascript_tool on the same tab:
 const siteBase = "https://jambitcom.sharepoint.com/sites/PoC-AIAssistedSoftwareDevelopment";
-// driveId and itemId from step 4
-const driveId = "<DRIVE_ID>";
-const itemId = "<ITEM_ID>";
+const driveId = "<DRIVE_ID>";   // from step 4
+const itemId  = "<ITEM_ID>";    // from step 4
+const outFile = '<YYYY-MM-DD-slugified-title>.vtt';  // derived in step 3
 
 const transcripts = await fetch(
   `${siteBase}/_api/v2.1/drives/${driveId}/items/${itemId}/media/transcripts`,
   {credentials: 'include', headers: {Accept: 'application/json'}}
 ).then(r => r.json());
 
-// Use the default transcript (isDefault: true) or the first one
 const t = transcripts.value.find(t => t.isDefault) ?? transcripts.value[0];
 const transcriptUrl = `${siteBase}/_api/v2.1/drives/${driveId}/items/${itemId}/media/transcripts/${t.id}/streamContent?is=1&applymediaedits=false`;
 
 window.__vtt = await fetch(transcriptUrl, {credentials: 'include'}).then(r => r.text());
-const filename = '<YYYY-MM-DD-slugified-title>.vtt';
-const resp = await fetch(`http://127.0.0.1:8765/${filename}`, {
-  method: 'POST',
-  headers: {'Content-Type': 'text/plain; charset=utf-8'},
-  body: window.__vtt
-});
-`POST ${resp.status}: ${await resp.text()} | length: ${window.__vtt.length} | lang: ${t.languageTag}`
+
+// Trigger download to ~/Downloads/<outFile>
+const blob = new Blob([window.__vtt], {type: 'text/vtt'});
+const url  = URL.createObjectURL(blob);
+const a    = document.createElement('a');
+a.href = url; a.download = outFile;
+document.body.appendChild(a); a.click();
+document.body.removeChild(a); URL.revokeObjectURL(url);
+
+`Downloaded ${window.__vtt.length} bytes | lang: ${t.languageTag} | file: ${outFile}`
 ```
 
-The response should be `POST 200: OK`.
-
-### 6. Verify
+### 5. Move file into the repo
 
 ```bash
+# Wait a moment for the download to land, then move it
+sleep 1
+ls -lh ~/Downloads/<slug>.vtt          # confirm it arrived
+mkdir -p docs/meetings
+mv ~/Downloads/<slug>.vtt docs/meetings/<slug>.vtt
 ls -lh docs/meetings/<slug>.vtt
 ```
 
-If a file already exists at that path, report it and ask before replacing.
+If a file already exists at `docs/meetings/<slug>.vtt`, report it and ask before replacing.
 
-### 7. Clean up
+### 6. Clean up
 
 Close the SharePoint tab:
 ```
 tabs_close_mcp(tabId=<tab>)
 ```
-The receiver server shuts itself down after one POST.
 
-### 8. Report
+### 7. Report
 
 Report the destination path and meeting title/date to the user.
 
@@ -174,5 +175,4 @@ Report the destination path and meeting title/date to the user.
 - **No Stream player needed** — the transcript is fetched entirely via REST API.
   Do not navigate to the Recordings folder or click any file.
 - Never modify or ingest anything outside `docs/meetings/`.
-- The receiver server handles one request then exits. Restart it if running the
-  skill more than once in a session.
+- The blob-download goes to `~/Downloads/` first; always `mv` it into the repo immediately after.
